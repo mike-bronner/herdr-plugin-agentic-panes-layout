@@ -2,10 +2,15 @@
 # agent-layout — apply the standard agent layout to the FOCUSED Herdr workspace:
 # the active tab renamed, an agent in the first pane, a bare shell beside it.
 #
-# The same recipe herdr-plugin-project-finder runs at workspace creation
-# (bin/pick-project, create_workspace), lifted out so it can be applied to a
-# workspace that already exists — a worktree made by Herdr's own new_worktree
-# action, a plain repo, or anything opened by hand.
+# The recipe the plugin's event hook runs on worktree.created, which the UI
+# new_worktree action was measured to emit. It is kept separate so it can also
+# be applied to a workspace that already exists: a plain repo, a worktree
+# opened rather than created, anything opened by hand.
+#
+# herdr-plugin-project-finder does not run it, although its workspaces come out
+# looking the same. That plugin declares only a picker pane and no events, and
+# its create_workspace() builds the layout inline with a tab rename, a pane
+# split and an agent start.
 #
 # Two ways in, and they are equals:
 #   * bin/on-event execs it on worktree.created
