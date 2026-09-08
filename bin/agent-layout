@@ -15,9 +15,8 @@
 # opened rather than created, anything opened by hand.
 #
 # herdr-plugin-project-finder does not run it, although its workspaces come out
-# looking the same. That plugin declares only a picker pane and no events, and
-# its create_workspace() builds the layout inline with a tab rename, a pane
-# split and an agent start.
+# looking the same: that plugin builds its own layout inline, so nothing here is
+# what lays out a picker-opened workspace.
 #
 # Two ways in, and they are equals:
 #   * bin/on-event execs it on worktree.created
@@ -281,8 +280,8 @@ label_pane "$SHELL_PANE" "$AGENT_LAYOUT_SHELL_LABEL"
 # Herdr agent names are [a-z][a-z0-9_-]{0,31}. Taken from the workspace label so
 # `herdr agent prompt <label>` reaches it. Deliberately NOT deduped against live
 # agents: 0.8.2's `agent list` exposes no name field at all, so there is nothing
-# to dedupe against — pick-project's helper reads a.get("name") and collects
-# {None}. A collision surfaces as the failing `agent start` below instead.
+# to dedupe against. A collision surfaces as the failing `agent start` below
+# instead.
 NAME="$(printf '%s' "$LABEL" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_-' '-' \
         | sed 's/^-*//; s/-*$//')"
 [ -n "$NAME" ] || NAME=agent
