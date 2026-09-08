@@ -205,8 +205,27 @@ eval "$info"
 # much the pane being split keeps".
 #
 # The split also puts the NEW pane after $PANE, so $PANE stays first and the
-# agent below lands there. --no-focus keeps the cursor on the agent rather than
-# following each new pane.
+# agent below lands there.
+#
+# WHAT --no-focus ACTUALLY DOES, and why it stays. Measured 2026-09-08 against
+# 0.8.2 in the isolated server described at the top of this file: `pane split`
+# does not move the cursor to the pane it creates. With --focus it moves, with
+# --no-focus it does not, and with neither flag it does not either. So
+# --no-focus is the DEFAULT said out loud, and --focus is the flag that does
+# something. `pane split --help` lists both and documents neither.
+#
+# Nor does --no-focus pin the cursor to the pane being split. It leaves the
+# cursor wherever it already is: splitting w3:p1 while the cursor sat on w3:p5
+# left it on w3:p5. In the call sequence below those two are the same pane,
+# which is how a wrong model of the flag went on producing the right answer.
+#
+# The layout therefore opens on the agent for a plainer reason than a flag. The
+# agent starts in the pane the workspace already arrived on, and nothing here
+# moves the cursor off it.
+#
+# --no-focus is kept as INSURANCE rather than mechanism, so do not strip it as a
+# dead no-op: an accidental --focus, or a later Herdr that changes the default,
+# would land the user in the bare shell the second split makes.
 #
 # `pane split` answers with the pane it created. That is the only way to learn
 # the id — it is not derivable from $PANE — and the second split needs the first
