@@ -175,6 +175,14 @@ The scripts are run for real as subprocesses, against a stub `herdr` binary and
 a stub recipe planted in a temporary directory. Nothing is imported and no pane
 is ever split.
 
+One check needs a newer interpreter than the plugin does. The suite parses
+`herdr-plugin.toml` for real, because Herdr re-reads that file at dispatch time
+and a syntax error in it stops the plugin silently. Parsing needs `tomllib`,
+which arrived in Python 3.11, and `/usr/bin/python3` is 3.9. Under 3.9 that one
+check is skipped and the run prints a banner saying so, because a green suite
+there is not a checked manifest. Run the suite under a 3.11 or newer
+interpreter to include it.
+
 ## Measuring Herdr behaviour
 
 Several comments in `bin/agent-layout` record behaviour that Herdr does not

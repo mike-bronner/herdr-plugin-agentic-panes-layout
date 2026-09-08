@@ -9,7 +9,35 @@ bin/agent-layout's entire job is which herdr commands it does or does not run.
 Stubbing the exec target and the herdr binary is what makes both observable
 without splitting a real pane.
 """
-import json, os, re, stat, subprocess, tempfile, unittest
+import json, os, re, stat, subprocess, sys, tempfile, unittest
+
+# ManifestIsValidToml at the foot of this file parses herdr-plugin.toml for
+# real, which needs tomllib — added in Python 3.11. The interpreter this plugin
+# targets is /usr/bin/python3, which PY below pins for the same reason
+# bin/config-env's shebang spells it: it is the one Herdr's launchd server can
+# reach. On macOS it is 3.9, so the check has to be skippable.
+#
+# A skip that reads as a pass would be worse than no check at all, hence the
+# banner: it is printed once, at import, on stderr, so no green run can be
+# mistaken for a checked manifest.
+try:
+    import tomllib
+except ModuleNotFoundError:
+    tomllib = None
+
+NO_TOML = ("Python %d.%d.%d has no tomllib, which arrived in 3.11"
+           % sys.version_info[:3])
+
+if tomllib is None:
+    print("\n%(bar)s\n"
+          "!! herdr-plugin.toml WAS NOT CHECKED: %(why)s.\n"
+          "!! The manifest parse test is SKIPPED, not passed. Herdr re-reads\n"
+          "!! that file at dispatch time, so one syntax error in it stops this\n"
+          "!! plugin dispatching, silently and with nothing surfaced. A green\n"
+          "!! run below does NOT say the manifest is valid TOML.\n"
+          "!! To really check it, re-run under a 3.11+ interpreter:\n"
+          "!!     python3.11 -m unittest discover tests\n"
+          "%(bar)s\n" % {"bar": "!" * 70, "why": NO_TOML}, file=sys.stderr)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, ".."))
@@ -855,6 +883,60 @@ class Manifest(unittest.TestCase):
         executable bit breaks both entry paths. bin/on-event and bin/config-env
         are always spawned through an interpreter and do not need one."""
         self.assertTrue(os.stat(LAYOUT).st_mode & stat.S_IXUSR)
+
+
+class ManifestIsValidToml(unittest.TestCase):
+    """The manifest has to PARSE, which nothing else in this suite checks.
+
+    Measured on 0.8.2, 2026-09-08: Herdr re-reads herdr-plugin.toml from disk
+    when it dispatches an event, rather than trusting the copy it cached in
+    plugins.json. An edit takes effect on the very next event — no re-link, no
+    restart, no reload-config. This is the other half of that: a syntax error
+    in the manifest stops every dispatch for this plugin, with no toast, no
+    error and nothing surfaced. The plugin simply goes quiet, and the first
+    sign is a worktree that never gets laid out.
+
+    The Manifest class above reads this same file, but by line prefix, so it
+    passes happily on a file Herdr itself cannot load. This class is the one
+    that would not.
+
+    Skipped, loudly, where tomllib is unavailable: see the banner at the top of
+    this file. A skip is not a pass.
+    """
+
+    def setUp(self):
+        if tomllib is None:
+            self.skipTest("herdr-plugin.toml was NOT parsed: " + NO_TOML)
+
+    def parse(self, path):
+        """The manifest at `path`, read exactly as Herdr's loader would."""
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+
+    def test_the_manifest_parses(self):
+        try:
+            self.parse(MANIFEST)
+        except tomllib.TOMLDecodeError as e:
+            self.fail("herdr-plugin.toml is not valid TOML: %s" % e)
+
+    def test_a_typo_in_the_manifest_is_really_caught(self):
+        """A canary on the test above, which would pass for two very different
+        reasons: the manifest is valid, or nothing is really parsing it.
+
+        The fixture is the REAL manifest plus one unterminated string, which is
+        what a typo looks like, written to a temporary directory. Corrupting
+        the real file to prove the point would be the same class of mistake
+        this test exists to catch.
+        """
+        with open(MANIFEST, "rb") as f:
+            typo = f.read() + b'\nname = "unterminated\n'
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        broken = os.path.join(tmp.name, "herdr-plugin.toml")
+        with open(broken, "wb") as f:
+            f.write(typo)
+        with self.assertRaises(tomllib.TOMLDecodeError):
+            self.parse(broken)
 
 
 if __name__ == "__main__":
