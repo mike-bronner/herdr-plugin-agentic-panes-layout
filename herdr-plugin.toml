@@ -1,0 +1,110 @@
+id = "mikebronner.agentic-panes-layout"
+name = "Agentic Panes Layout"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Lay out a newly created worktree workspace: agent one side, shell the other"
+platforms = ["macos", "linux"]
+
+# TWO subscriptions, and they are NOT peers. worktree.created acts.
+# worktree.opened is temporary instrumentation that deliberately does nothing.
+# Both were chosen by measurement rather than by belt and braces.
+#
+# ---------------------------------------------------------------------------
+# THE ACTING SUBSCRIPTION: worktree.created
+# ---------------------------------------------------------------------------
+#
+# Two third-party plugins (razajamil/herdr-plugin-workspace-manager,
+# danilolucasmd/herdr-clone-layout) each subscribe to worktree.created,
+# workspace.created AND workspace.focused, on the belief that the in-app
+# new_worktree command emits only workspace.focused. That is not true of 0.8.2.
+#
+# Measured on 0.8.2, 2026-09-05, by subscribing all three and reading
+# `herdr plugin log list --plugin mikebronner.agentic-panes-layout`:
+#
+#   CLI  `worktree create --focus`   workspace.created, worktree.created,
+#                                    workspace.focused — all within 2ms
+#   UI   new_worktree (prefix+ctrl+n) workspace.created, worktree.created
+#                                    — 1ms apart, no workspace.focused
+#
+# worktree.created is the only event common to both paths, and it is the one
+# that names what happened. So it is the only event that RUNS THE LAYOUT.
+#
+# The other two are gone, not kept as insurance. workspace.focused fired 58
+# times in the 60-entry sample against one real worktree creation: that is 58
+# subprocess spawns a session to reach an early exit. And a second ACTING
+# subscription would be actively wrong, not merely wasteful — those events fire
+# 1ms apart, Herdr does NOT serialize hooks (a 5s hook was measured not to delay
+# the next API call), and bin/agent-layout's "already laid out?" guard reads pane
+# count over the API. Two concurrent copies would both see one pane and both
+# would split. That guard makes a LATER run safe, not a SIMULTANEOUS one.
+#
+# That is why the second subscription below is log-only rather than acting. A
+# subscription that only ever reaches the early exit in gate 1 cannot join that
+# race, whatever it turns out to fire alongside.
+#
+# ---------------------------------------------------------------------------
+# TEMPORARY INSTRUMENTATION: worktree.opened — log-only, must not survive
+# ---------------------------------------------------------------------------
+#
+# Added 2026-09-05 to answer ONE question: what does prefix+ctrl+o
+# (open_worktree) emit?
+#
+# It exists because of the KNOWN ANOMALY: one worktree (bible-models/
+# update-for-migrations, 2026-09-05 10:30:41) appeared with NO events logged at
+# all, while the plugin was armed since 10:19:21 and demonstrably logging events
+# either side of it. The leading hypothesis is that it was never a creation. An
+# open_worktree on an existing checkout emits worktree.opened, which was not
+# subscribed, and unsubscribed is indistinguishable from silent.
+#
+# The answer is not only diagnostic. Opening a worktree that has no workspace
+# yet also produces a workspace with one bare pane, which wants the same layout.
+# So this measurement can turn into a feature.
+#
+# Measured on 0.8.2, 2026-09-05, in an isolated `herdr --session` server, by
+# subscribing a throwaway plugin to worktree.created AND worktree.opened and
+# reading HERDR_PLUGIN_EVENT_JSON:
+#
+#   open, no workspace for that checkout   worktree.opened, already_open=false,
+#                                          workspace focused, pane_count 1
+#   open again, same worktree              worktree.opened, already_open=true,
+#                                          same workspace_id
+#
+# NEITHER open emitted worktree.created. The two events do not co-occur, so the
+# 1ms double-fire hazard above does not apply between them. What is unsettled is
+# the DECISION, not the mechanics: already_open=true must not re-lay-out a
+# workspace, and only real use shows how often each case occurs.
+#
+# Read the log back with:
+#   herdr plugin log list --plugin mikebronner.agentic-panes-layout
+#
+# EXIT CONDITION — this block does not stay as it is. Once prefix+ctrl+o has
+# been pressed on a real worktree and the log has been read, resolve it one of
+# three ways:
+#
+#   1. worktree.opened logged with already_open=false. PROMOTE it: add it to
+#      gate 1 in bin/on-event so it lays out that bare workspace. Nothing else
+#      lays it out today, because open emits no worktree.created. Gate 2
+#      (focused) and bin/agent-layout's own pane-count guard cover the rest, and
+#      the guard is what makes an already_open=true press a safe no-op.
+#   2. worktree.opened logged only with already_open=true. DELETE this block.
+#      Those workspaces already exist and are already laid out.
+#   3. worktree.opened never logged. DELETE this block. The 10:30:41 anomaly
+#      stays unexplained, and the open_worktree hypothesis is dead.
+#
+# Cases 1 and 2 can both appear in the log, because already_open reports the
+# state at the moment of the press. Case 1 decides it: it is the only case that
+# leaves a bare workspace unstyled.
+#
+# Until then it is log-only ON PURPOSE. Do NOT add it to gate 1 "while we are
+# here". Promotion is a decision to take with the log in hand, not a tidy-up.
+
+[[events]]
+on = "worktree.created"
+command = ["sh", "bin/on-event"]
+
+# TEMPORARY. See the exit condition above before touching this. Log-only for
+# free: gate 1 in bin/on-event compares against worktree.created, so this event
+# is recorded by Herdr and then exits without laying anything out.
+[[events]]
+on = "worktree.opened"
+command = ["sh", "bin/on-event"]

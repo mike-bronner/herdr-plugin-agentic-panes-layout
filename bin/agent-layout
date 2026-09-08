@@ -1,0 +1,183 @@
+#!/bin/sh
+# agent-layout — apply the standard agent layout to the FOCUSED Herdr workspace:
+# the active tab renamed, an agent in the first pane, a bare shell beside it.
+#
+# The same recipe herdr-plugin-project-finder runs at workspace creation
+# (bin/pick-project, create_workspace), lifted out so it can be applied to a
+# workspace that already exists — a worktree made by Herdr's own new_worktree
+# action, a plain repo, or anything opened by hand.
+#
+# Two ways in, and they are equals:
+#   * bin/on-event execs it on worktree.created
+#   * a [[keys.command]] binding (prefix+ctrl+l by convention) runs it by hand
+#
+# Safe to run again: it refuses to touch a tab that already has more than one
+# pane or already hosts an agent.
+#
+# POSIX sh, not bash: the manifest declares linux as well as macos, and a minimal
+# Linux image ships /bin/sh as dash. Nothing below is a bashism. `pipefail` went
+# with the shebang and is not missed — both pipelines below end in a python that
+# dereferences the JSON it was piped, so a failed herdr leaves empty stdin and
+# python exits non-zero on its own.
+set -eu
+
+# --- how the target is chosen -----------------------------------------------
+#
+# The FOCUSED workspace, asked for over the API — never the caller's own pane.
+#
+# A [[keys.command]] type="shell" process is spawned detached and has no pane of
+# its own. Measured 2026-09-05 against 0.8.2, by pressing the key for real inside
+# an isolated `herdr --session probe`, it is handed exactly:
+#
+#   HERDR_ACTIVE_WORKSPACE_ID  HERDR_ACTIVE_TAB_ID
+#   HERDR_ACTIVE_PANE_ID       HERDR_ACTIVE_PANE_CWD
+#   HERDR_BIN_PATH             HERDR_SOCKET_PATH  HERDR_SESSION
+#
+# HERDR_PANE_ID is NOT among them — that variable belongs to the env Herdr
+# injects into a managed pane, which is a different set entirely. Neither is
+# HERDR_PLUGIN_CONFIG_DIR, which is why bin/config-env has to find it the hard
+# way when this script is reached from a keybinding.
+#
+# Those HERDR_ACTIVE_* vars would serve here, and are deliberately unused. A
+# plugin EVENT hook gets the pane set (HERDR_PANE_ID / HERDR_WORKSPACE_ID /
+# HERDR_TAB_ID) instead, and running this by hand from a shell gets neither
+# set. Asking for the focused workspace is the one answer correct in all three,
+# which is what lets bin/on-event exec this file unchanged. It is also the
+# better semantic: "lay out the workspace I am looking at".
+
+# Herdr runs under launchd with a minimal PATH, so a bare `herdr` is not
+# resolvable and /opt/homebrew is not on it — the same trap that killed four
+# third-party plugins. HERDR_BIN_PATH is injected into both keybinding commands
+# and plugin commands; fall back to the Homebrew location for a hand-run
+# invocation from an ordinary shell.
+HERDR="${HERDR_BIN_PATH:-/opt/homebrew/bin/herdr}"
+PY=/usr/bin/python3
+
+# Detached means stderr goes nowhere a human will read, so every message is
+# ALSO a Herdr toast. A silent no-op is the one failure mode worth engineering
+# against here. The toast is best-effort: it must never mask the real message.
+say() {
+    printf 'agent-layout: %s\n' "$*" >&2
+    "$HERDR" notification show "agent layout" --body "$*" >/dev/null 2>&1 || true
+}
+die() { say "$*"; exit 1; }
+
+[ -x "$HERDR" ] || die "no herdr binary at $HERDR"
+[ -x "$PY" ] || die "no python3 at $PY"
+
+# --- settings ----------------------------------------------------------------
+#
+# Read here rather than inherited from bin/on-event, because a keybinding press
+# never passes through that file. bin/config-env locates the config directory
+# for both entry paths and applies the defaults, so this script only consumes
+# the answer: AGENT_LAYOUT_KIND, _DIRECTION, _RATIO, _TAB_NAME (_RECIPE belongs
+# to bin/on-event, which decides what to exec before this file is reached).
+#
+# The values go straight into herdr's argv, never into a shell string, so a
+# hostile .env cannot inject a command. A nonsense value is Herdr's to reject,
+# and the die messages below quote it so the toast names the setting at fault.
+PLUGIN_ROOT="${HERDR_PLUGIN_ROOT:-$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)}"
+settings="$("$PY" "$PLUGIN_ROOT/bin/config-env")" \
+    || die "cannot read the plugin settings from $PLUGIN_ROOT"
+eval "$settings"
+
+# --- resolve the target ------------------------------------------------------
+
+# Each block eval's shell assignments that python emits already shlex-quoted, so
+# a label or path containing spaces survives. The status is captured OUTSIDE the
+# substitution on purpose: `die` inside one would exit only its subshell, and
+# set -u would then fail on the unset variable instead of saying anything useful.
+info="$("$HERDR" workspace list 2>/dev/null | "$PY" -c '
+import json, shlex, sys
+ws = json.load(sys.stdin)["result"]["workspaces"]
+w = next((x for x in ws if x.get("focused")), None)
+if not w:
+    sys.exit(1)
+print("WS=" + shlex.quote(w["workspace_id"]))
+print("TAB=" + shlex.quote(w["active_tab_id"]))
+print("LABEL=" + shlex.quote(w.get("label") or w["workspace_id"]))
+' 2>/dev/null)" || die "cannot read a focused workspace from the Herdr server"
+eval "$info"
+
+export TAB
+info="$("$HERDR" pane list --workspace "$WS" 2>/dev/null | "$PY" -c '
+import json, os, shlex, sys
+panes = [p for p in json.load(sys.stdin)["result"]["panes"]
+         if p.get("tab_id") == os.environ["TAB"]]
+print("COUNT=%d" % len(panes))
+if len(panes) == 1:
+    print("PANE=" + shlex.quote(panes[0]["pane_id"]))
+    print("CWD=" + shlex.quote(panes[0].get("cwd") or ""))
+    print("AGENT=" + shlex.quote(panes[0].get("agent") or ""))
+' 2>/dev/null)" || die "cannot list the panes of $LABEL"
+eval "$info"
+
+# --- refuse to lay out a workspace that already is ---------------------------
+
+[ "$COUNT" = 1 ] || { say "$LABEL: active tab has $COUNT panes, not 1 — left alone"; exit 0; }
+[ -z "$AGENT" ] || { say "$LABEL: pane already runs $AGENT — left alone"; exit 0; }
+[ -n "$CWD" ] || die "$LABEL: pane reports no working directory"
+
+# --- apply -------------------------------------------------------------------
+
+"$HERDR" tab rename "$TAB" "$AGENT_LAYOUT_TAB_NAME" >/dev/null \
+    || die "$LABEL: could not rename the tab to \"$AGENT_LAYOUT_TAB_NAME\""
+
+# The split puts the NEW pane after $PANE, so $PANE stays first and the agent
+# below lands there: agent left, bare shell right, or agent above and shell
+# below with AGENT_LAYOUT_DIRECTION=down. Not a bug to fix. --no-focus keeps the
+# cursor on the agent rather than the new shell.
+"$HERDR" pane split --pane "$PANE" --direction "$AGENT_LAYOUT_DIRECTION" \
+    --ratio "$AGENT_LAYOUT_RATIO" --cwd "$CWD" --no-focus >/dev/null \
+    || die "$LABEL: could not split the pane ($AGENT_LAYOUT_DIRECTION, ratio $AGENT_LAYOUT_RATIO)"
+
+# Herdr agent names are [a-z][a-z0-9_-]{0,31}. Taken from the workspace label so
+# `herdr agent prompt <label>` reaches it. Deliberately NOT deduped against live
+# agents: 0.8.2's `agent list` exposes no name field at all, so there is nothing
+# to dedupe against — pick-project's helper reads a.get("name") and collects
+# {None}. A collision surfaces as the failing `agent start` below instead.
+NAME="$(printf '%s' "$LABEL" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_-' '-' \
+        | sed 's/^-*//; s/-*$//')"
+[ -n "$NAME" ] || NAME=agent
+case "$NAME" in [a-z]*) ;; *) NAME="a${NAME}" ;; esac
+# Truncate LAST, not before the prefix above: a 32-character label starting with
+# a digit would otherwise come out 33 characters and be rejected.
+NAME="$(printf '%s' "$NAME" | cut -c1-32)"
+
+# No --timeout: it has a 3000ms MINIMUM, so a short value is rejected outright.
+# The 30s default costs nothing because this process is already detached, and
+# blocking is what makes a startup failure reportable at all.
+#
+# A non-zero exit here is NOT automatically a failure. Herdr's own documentation
+# (`herdr --skill`, 0.8.2) says of `agent start`: "If the agent is blocked during
+# startup, the command returns `agent_not_ready` immediately but keeps the name
+# available for `agent read` and `agent send-keys`." So agent_not_ready means the
+# agent DID start and is sitting at a question — on a fresh worktree, that is
+# Claude Code's trust-this-folder prompt, which is the NORMAL case here. Treating
+# every non-zero exit as fatal turned a working layout into a red toast in
+# `herdr plugin log list`.
+#
+# The code arrives as compact JSON on stderr. Measured on 0.8.2:
+#   {"error":{"code":"agent_pane_not_found","message":"..."},"id":"cli:agent:start"}
+# so stderr is captured for matching (2>&1 >/dev/null redirects stderr into the
+# substitution and still discards the ordinary stdout) and re-emitted on the
+# fatal path, where Herdr's own wording is the useful part of the log entry.
+#
+# Only agent_not_ready is reclassified. Everything else stays fatal, including
+# agent_pane_busy ("is not an available shell"), which is a real race with no
+# measured fix — see README, "Known limitation".
+if start_err="$("$HERDR" agent start "$NAME" --kind "$AGENT_LAYOUT_KIND" \
+        --pane "$PANE" 2>&1 >/dev/null)"; then
+    say "$LABEL: $AGENT_LAYOUT_KIND started as \"$NAME\", shell split $AGENT_LAYOUT_DIRECTION, tab named $AGENT_LAYOUT_TAB_NAME"
+    exit 0
+fi
+
+case "$start_err" in
+    *'"code":"agent_not_ready"'*)
+        say "$LABEL: $AGENT_LAYOUT_KIND started as \"$NAME\" and is waiting on a prompt — layout done"
+        exit 0
+        ;;
+esac
+
+printf '%s\n' "$start_err" >&2
+die "$LABEL: split done, but $AGENT_LAYOUT_KIND did not start as \"$NAME\""
