@@ -9,7 +9,7 @@ bin/agent-layout's entire job is which herdr commands it does or does not run.
 Stubbing the exec target and the herdr binary is what makes both observable
 without splitting a real pane.
 """
-import json, os, stat, subprocess, tempfile, unittest
+import json, os, re, stat, subprocess, tempfile, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, ".."))
@@ -40,20 +40,54 @@ DEFAULTS = {
     "AGENT_LAYOUT_DIRECTION": "right",
     "AGENT_LAYOUT_RATIO": "0.5",
     "AGENT_LAYOUT_TAB_NAME": "agent",
+    "AGENT_LAYOUT_TOOL_COMMAND": "lazygit",
+    "AGENT_LAYOUT_TOOL_DIRECTION": "down",
+    "AGENT_LAYOUT_TOOL_RATIO": "0.6",
+    "AGENT_LAYOUT_AGENT_LABEL": "agent",
+    "AGENT_LAYOUT_TOOL_LABEL": "lazygit",
+    "AGENT_LAYOUT_SHELL_LABEL": "shell",
     "AGENT_LAYOUT_RECIPE": "",
 }
 
 # Stand-in for the herdr CLI. Records every invocation to $STUB_LOG, answers the
 # two list calls from fixture files, and takes its `agent start` outcome from the
 # environment so a test can pick success, agent_not_ready, or a real failure.
+#
+# `pane split` is the one call with a real answer to model. The recipe reads the
+# new pane's id back out of it, and the SECOND split targets the pane the FIRST
+# one returned, so the stub has to hand out a fresh id each time rather than a
+# fixed one. It counts calls in a file and answers p2 then p3, which is what lets
+# a test tell the two panes apart. STUB_SPLIT_STATUS fails the first split and
+# STUB_SPLIT2_STATUS the second, so each can be exercised on its own.
+#
+# Two logs, because "$*" flattens argv. `pane rename p2 "my tool"` and
+# `pane rename p2 my tool` are the same line in $STUB_LOG and different lines in
+# $STUB_ARGV_LOG, which is the only way to pin that a label with a space stays
+# ONE argument. $STUB_LOG stays because it keeps the ordinary assertions
+# readable.
 STUB_HERDR = """#!/bin/sh
 printf '%s\\n' "$*" >> "$STUB_LOG"
+for a in "$@"; do printf '[%s]' "$a" >> "$STUB_ARGV_LOG"; done
+printf '\\n' >> "$STUB_ARGV_LOG"
 case "$1 $2" in
     "workspace list")    cat "$STUB_WORKSPACES" ;;
     "pane list")         cat "$STUB_PANES" ;;
     "plugin config-dir") printf '%s\\n' "${STUB_CONFIG_DIR:-}" ;;
     "tab rename")        exit "${STUB_RENAME_STATUS:-0}" ;;
-    "pane split")        exit "${STUB_SPLIT_STATUS:-0}" ;;
+    "pane rename")       exit "${STUB_LABEL_STATUS:-0}" ;;
+    "pane run")          exit "${STUB_RUN_STATUS:-0}" ;;
+    "pane split")
+        n=$(cat "$STUB_SPLIT_COUNT" 2>/dev/null || printf 0)
+        n=$((n + 1))
+        printf '%s' "$n" > "$STUB_SPLIT_COUNT"
+        if [ "$n" = 1 ]; then
+            [ "${STUB_SPLIT_STATUS:-0}" = 0 ] || exit "${STUB_SPLIT_STATUS}"
+        else
+            [ "${STUB_SPLIT2_STATUS:-0}" = 0 ] || exit "${STUB_SPLIT2_STATUS}"
+        fi
+        printf '{"result":{"pane":{"pane_id":"p%d"}},"type":"pane_info"}\\n' \
+            "$((n + 1))"
+        ;;
     "notification show") : ;;
     "agent start")
         if [ -n "${STUB_AGENT_STDERR:-}" ]; then
@@ -110,6 +144,7 @@ class TempPluginCase(unittest.TestCase):
         self.config_dir = os.path.join(self.tmp.name, "config")
         os.makedirs(self.config_dir)
         self.log = os.path.join(self.tmp.name, "herdr.log")
+        self.argv_log = os.path.join(self.tmp.name, "herdr-argv.log")
         self.herdr = write_script(os.path.join(self.tmp.name, "herdr"),
                                   STUB_HERDR)
 
@@ -122,14 +157,24 @@ class TempPluginCase(unittest.TestCase):
         AGENT_LAYOUT_* variable in the developer's shell must not decide a
         test."""
         return {"PATH": LAUNCHD_PATH, "HOME": self.tmp.name,
-                "HERDR_BIN_PATH": self.herdr, "STUB_LOG": self.log}
+                "HERDR_BIN_PATH": self.herdr, "STUB_LOG": self.log,
+                "STUB_ARGV_LOG": self.argv_log,
+                "STUB_SPLIT_COUNT": os.path.join(self.tmp.name, "splits")}
 
-    def herdr_calls(self):
+    def read_log(self, path):
         try:
-            with open(self.log) as f:
+            with open(path) as f:
                 return [line.rstrip("\n") for line in f]
         except OSError:
             return []
+
+    def herdr_calls(self):
+        return self.read_log(self.log)
+
+    def herdr_argv(self):
+        """Each call as "[herdr][pane][rename][p2][my tool]", so argument
+        boundaries are visible rather than flattened by "$*"."""
+        return self.read_log(self.argv_log)
 
 
 # ---------------------------------------------------------------------------
@@ -166,18 +211,27 @@ class ConfigEnv(TempPluginCase):
         self.assertEqual(self.settings(), DEFAULTS)
 
     def test_every_key_can_be_set(self):
-        self.write_env("AGENT_LAYOUT_KIND=codex\n"
-                       "AGENT_LAYOUT_DIRECTION=down\n"
-                       "AGENT_LAYOUT_RATIO=0.3\n"
-                       "AGENT_LAYOUT_TAB_NAME=work\n"
-                       "AGENT_LAYOUT_RECIPE=/tmp/mine\n")
-        self.assertEqual(self.settings(), {
+        """Every key, and no key left at its default: a setting that silently
+        ignores the file is the failure this catches, so the fixture value
+        differs from the default in every single row."""
+        overrides = {
             "AGENT_LAYOUT_KIND": "codex",
             "AGENT_LAYOUT_DIRECTION": "down",
             "AGENT_LAYOUT_RATIO": "0.3",
             "AGENT_LAYOUT_TAB_NAME": "work",
+            "AGENT_LAYOUT_TOOL_COMMAND": "gitui",
+            "AGENT_LAYOUT_TOOL_DIRECTION": "right",
+            "AGENT_LAYOUT_TOOL_RATIO": "0.75",
+            "AGENT_LAYOUT_AGENT_LABEL": "claude",
+            "AGENT_LAYOUT_TOOL_LABEL": "git",
+            "AGENT_LAYOUT_SHELL_LABEL": "term",
             "AGENT_LAYOUT_RECIPE": "/tmp/mine",
-        })
+        }
+        self.assertEqual(set(overrides), set(DEFAULTS))
+        for key, value in overrides.items():
+            self.assertNotEqual(value, DEFAULTS[key], key)
+        self.write_env("".join("%s=%s\n" % kv for kv in overrides.items()))
+        self.assertEqual(self.settings(), overrides)
 
     def test_one_key_set_leaves_the_others_at_their_defaults(self):
         self.write_env("AGENT_LAYOUT_RATIO=0.25\n")
@@ -452,7 +506,7 @@ class LayoutCase(TempPluginCase):
 
 
 class LayoutApplies(LayoutCase):
-    """The three commands that make up the layout, and the settings they read."""
+    """Every command that makes up the layout, and the settings each reads."""
 
     def test_defaults_reach_the_herdr_command_line(self):
         self.run_layout()
@@ -460,19 +514,74 @@ class LayoutApplies(LayoutCase):
         self.assertIn("tab rename t1 agent", calls)
         self.assertIn("pane split --pane p1 --direction right --ratio 0.5"
                       " --cwd /tmp/proj --no-focus", calls)
+        self.assertIn("pane split --pane p2 --direction down --ratio 0.6"
+                      " --cwd /tmp/proj --no-focus", calls)
+        self.assertIn("pane run p2 lazygit", calls)
         self.assertIn("agent start proj-one --kind claude --pane p1", calls)
 
     def test_settings_reach_the_herdr_command_line(self):
         self.write_env("AGENT_LAYOUT_KIND=codex\n"
                        "AGENT_LAYOUT_DIRECTION=down\n"
                        "AGENT_LAYOUT_RATIO=0.35\n"
-                       "AGENT_LAYOUT_TAB_NAME=work\n")
+                       "AGENT_LAYOUT_TAB_NAME=work\n"
+                       "AGENT_LAYOUT_TOOL_COMMAND=gitui\n"
+                       "AGENT_LAYOUT_TOOL_DIRECTION=right\n"
+                       "AGENT_LAYOUT_TOOL_RATIO=0.75\n")
         self.run_layout()
         calls = self.herdr_calls()
         self.assertIn("tab rename t1 work", calls)
         self.assertIn("pane split --pane p1 --direction down --ratio 0.35"
                       " --cwd /tmp/proj --no-focus", calls)
+        self.assertIn("pane split --pane p2 --direction right --ratio 0.75"
+                      " --cwd /tmp/proj --no-focus", calls)
+        self.assertIn("pane run p2 gitui", calls)
         self.assertIn("agent start proj-one --kind codex --pane p1", calls)
+
+    def test_the_second_split_targets_the_pane_the_first_one_made(self):
+        """The crux of the two-split layout. The tool pane's id is not knowable
+        in advance: it only exists in `pane split`'s answer. Splitting p1 twice
+        would stack three panes down the agent's side instead of dividing the
+        column beside it, and every ratio would then apply to the wrong pane."""
+        self.run_layout()
+        splits = [c for c in self.herdr_calls() if c.startswith("pane split")]
+        self.assertEqual(len(splits), 2)
+        self.assertIn("--pane p1", splits[0])
+        self.assertIn("--pane p2", splits[1])
+
+    def test_the_tool_command_runs_in_the_tool_pane_not_the_others(self):
+        """p2 is the pane the first split made. Running lazygit in p1 would
+        replace the agent, and in p3 would fill the bare shell."""
+        self.run_layout()
+        runs = [c for c in self.herdr_calls() if c.startswith("pane run")]
+        self.assertEqual(runs, ["pane run p2 lazygit"])
+
+    def test_all_three_panes_are_labelled(self):
+        self.run_layout()
+        renames = [c for c in self.herdr_calls()
+                   if c.startswith("pane rename")]
+        self.assertEqual(renames, ["pane rename p1 agent",
+                                   "pane rename p2 lazygit",
+                                   "pane rename p3 shell"])
+
+    def test_the_labels_are_settings(self):
+        self.write_env("AGENT_LAYOUT_AGENT_LABEL=claude\n"
+                       "AGENT_LAYOUT_TOOL_LABEL=git\n"
+                       "AGENT_LAYOUT_SHELL_LABEL=term\n")
+        self.run_layout()
+        renames = [c for c in self.herdr_calls()
+                   if c.startswith("pane rename")]
+        self.assertEqual(renames, ["pane rename p1 claude",
+                                   "pane rename p2 git",
+                                   "pane rename p3 term"])
+
+    def test_a_label_containing_a_space_stays_one_argument(self):
+        """`pane rename` takes LABEL as variadic, so an unquoted expansion would
+        silently work. The tab name has the same property and is already pinned
+        in bin/config-env's tests: this pins it at the pane-rename call site."""
+        self.write_env("AGENT_LAYOUT_TOOL_LABEL=my tool\n")
+        self.run_layout()
+        self.assertIn("[pane][rename][p2][my tool]", self.herdr_argv())
+        self.assertNotIn("[pane][rename][p2][my][tool]", self.herdr_argv())
 
     def test_the_agent_name_is_derived_from_the_workspace_label(self):
         self.set_workspaces({"result": {"workspaces": [
@@ -494,12 +603,75 @@ class LayoutApplies(LayoutCase):
         err = self.run_layout(env={"STUB_SPLIT_STATUS": "1"}, expect_status=1)
         self.assertIn("could not split the pane (right, ratio 0.5)", err)
 
+    def test_a_failed_first_split_never_reaches_the_second(self):
+        """The second split needs the first one's answer. Carrying on with an
+        empty pane id would aim `pane split` and `pane run` at nothing."""
+        self.run_layout(env={"STUB_SPLIT_STATUS": "1"}, expect_status=1)
+        calls = self.herdr_calls()
+        self.assertEqual([c for c in calls if c.startswith("pane split")],
+                         ["pane split --pane p1 --direction right --ratio 0.5"
+                          " --cwd /tmp/proj --no-focus"])
+        self.assertEqual([c for c in calls if c.startswith("pane run")], [])
+
+    def test_a_failed_second_split_is_fatal_and_names_its_own_settings(self):
+        """Distinct from the first split's message, which names the other pair
+        of settings. Reporting the wrong ratio would send the user to the wrong
+        line of their .env."""
+        err = self.run_layout(env={"STUB_SPLIT2_STATUS": "1"}, expect_status=1)
+        self.assertIn("could not split the tool pane (down, ratio 0.6)", err)
+        self.assertNotIn("could not split the pane (", err)
+
+    def test_a_failed_second_split_stops_before_running_the_tool(self):
+        self.run_layout(env={"STUB_SPLIT2_STATUS": "1"}, expect_status=1)
+        self.assertEqual([c for c in self.herdr_calls()
+                          if c.startswith(("pane run", "pane rename",
+                                           "agent start"))], [])
+
     def test_no_focused_workspace_is_fatal(self):
         self.set_workspaces({"result": {"workspaces": [
             {"workspace_id": "w9", "active_tab_id": "t1", "label": "x",
              "focused": False}]}})
         err = self.run_layout(expect_status=1)
         self.assertIn("cannot read a focused workspace", err)
+
+
+class PostStructureFailures(LayoutCase):
+    """Once the panes exist, a failure is reported and the run still succeeds.
+
+    The split of responsibility is deliberate and is the mirror of
+    LayoutApplies' fatal cases. A failed TAB rename happens before any pane is
+    created, so dying leaves a clean single pane the next run can lay out. A
+    failed lazygit or label happens after three panes exist, where the guard in
+    LayoutGuards makes every later run a no-op — so exiting non-zero would
+    record a layout that was in fact built as a failure, and nothing could ever
+    finish it. The toast still fires either way.
+    """
+
+    def test_a_failed_tool_command_warns_but_the_layout_stands(self):
+        err = self.run_layout(env={"STUB_RUN_STATUS": "1"})
+        self.assertIn('"lazygit" would not run', err)
+
+    def test_a_failed_tool_command_does_not_stop_the_labels_or_the_agent(self):
+        self.run_layout(env={"STUB_RUN_STATUS": "1"})
+        calls = self.herdr_calls()
+        self.assertIn("pane rename p3 shell", calls)
+        self.assertIn("agent start proj-one --kind claude --pane p1", calls)
+
+    def test_a_failed_label_warns_but_the_layout_stands(self):
+        err = self.run_layout(env={"STUB_LABEL_STATUS": "1"})
+        self.assertIn("could not label pane p1", err)
+
+    def test_a_failed_label_does_not_stop_the_remaining_labels(self):
+        """One unlabelled pane must not cost the other two their labels."""
+        self.run_layout(env={"STUB_LABEL_STATUS": "1"})
+        renames = [c for c in self.herdr_calls()
+                   if c.startswith("pane rename")]
+        self.assertEqual(len(renames), 3)
+
+    def test_a_failed_label_does_not_stop_the_agent(self):
+        self.run_layout(env={"STUB_LABEL_STATUS": "1"})
+        self.assertIn("agent start proj-one --kind claude --pane p1",
+                      self.herdr_calls())
 
 
 class LayoutGuards(LayoutCase):
@@ -513,6 +685,7 @@ class LayoutGuards(LayoutCase):
         self.assertIn("active tab has 2 panes, not 1 — left alone", err)
         self.assertEqual([c for c in self.herdr_calls()
                           if c.startswith(("tab rename", "pane split",
+                                           "pane run", "pane rename",
                                            "agent start"))], [])
 
     def test_a_pane_already_running_an_agent_is_left_alone(self):
@@ -523,6 +696,7 @@ class LayoutGuards(LayoutCase):
         self.assertIn("pane already runs claude — left alone", err)
         self.assertEqual([c for c in self.herdr_calls()
                           if c.startswith(("tab rename", "pane split",
+                                           "pane run", "pane rename",
                                            "agent start"))], [])
 
     def test_a_pane_in_another_tab_is_not_counted(self):
@@ -554,7 +728,7 @@ class AgentStartOutcome(LayoutCase):
     def test_success_reports_the_layout_it_applied(self):
         err = self.run_layout()
         self.assertIn("claude started as \"proj-one\"", err)
-        self.assertIn("shell split right", err)
+        self.assertIn("lazygit down beside it", err)
         self.assertIn("tab named agent", err)
 
     def test_agent_not_ready_is_a_success_with_its_own_message(self):
@@ -654,6 +828,27 @@ class Manifest(unittest.TestCase):
             asked = [line.split('"')[1] for line in f
                      if line.startswith("PLUGIN_ID = ")]
         self.assertEqual(declared, asked)
+
+    def test_the_readme_documents_exactly_the_settings_that_exist(self):
+        """The README lists every key and its default by hand, so it drifts the
+        moment a setting is added or renamed. Both directions matter: an
+        undocumented setting is invisible to the user, and a documented one that
+        no longer exists sends them to edit a key nothing reads."""
+        with open(os.path.join(ROOT, "README.md")) as f:
+            readme = f.read()
+        documented = set(re.findall(r"AGENT_LAYOUT_[A-Z_]+", readme))
+        self.assertEqual(documented, set(DEFAULTS))
+
+    def test_the_readme_states_each_default_value(self):
+        """Pinning the names alone would let `(default: 0.6)` rot into a lie
+        the next time a default moves, which is the kind of stale number a
+        reader trusts."""
+        with open(os.path.join(ROOT, "README.md")) as f:
+            readme = f.read()
+        for key, default in DEFAULTS.items():
+            if not default:
+                continue  # AGENT_LAYOUT_RECIPE: documented as "unset"
+            self.assertIn(default, readme, "%s default %r" % (key, default))
 
     def test_the_recipe_is_executable(self):
         """bin/on-event execs it and the keybinding runs it directly, so a lost

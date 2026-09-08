@@ -6,7 +6,7 @@ rules live in exactly one place:
 
     eval "$(/usr/bin/python3 "$PLUGIN_ROOT/bin/config-env")"
 
-bin/on-event needs AGENT_LAYOUT_RECIPE. bin/agent-layout needs the other four.
+bin/on-event needs AGENT_LAYOUT_RECIPE. bin/agent-layout needs the other ten.
 bin/agent-layout is also reachable straight from a keybinding, which never
 passes through bin/on-event and sees a different environment entirely (see
 config_dir below). One reader covers all three callers.
@@ -32,11 +32,24 @@ PLUGIN_ID = "mikebronner.agentic-panes-layout"
 # An unset key and an empty key both mean "default": an .env line reading
 # `AGENT_LAYOUT_KIND=` is indistinguishable from a missing one, and treating it
 # as "no agent kind at all" would only produce a confusing Herdr error.
+#
+# The layout is TWO splits, so each split owns a direction and a ratio. The
+# unprefixed pair is the first split (agent against the rest); the _TOOL_ pair
+# is the second (the tool pane against the bare shell below it).
+#
+# Both ratios name the share kept by the pane BEING SPLIT, which is measured,
+# not assumed — see the comment above the splits in bin/agent-layout.
 DEFAULTS = {
     "AGENT_LAYOUT_KIND": "claude",
     "AGENT_LAYOUT_DIRECTION": "right",
     "AGENT_LAYOUT_RATIO": "0.5",
     "AGENT_LAYOUT_TAB_NAME": "agent",
+    "AGENT_LAYOUT_TOOL_COMMAND": "lazygit",
+    "AGENT_LAYOUT_TOOL_DIRECTION": "down",
+    "AGENT_LAYOUT_TOOL_RATIO": "0.6",
+    "AGENT_LAYOUT_AGENT_LABEL": "agent",
+    "AGENT_LAYOUT_TOOL_LABEL": "lazygit",
+    "AGENT_LAYOUT_SHELL_LABEL": "shell",
     "AGENT_LAYOUT_RECIPE": "",
 }
 

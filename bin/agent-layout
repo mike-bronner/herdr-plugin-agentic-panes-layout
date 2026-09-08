@@ -1,6 +1,13 @@
 #!/bin/sh
 # agent-layout — apply the standard agent layout to the FOCUSED Herdr workspace:
-# the active tab renamed, an agent in the first pane, a bare shell beside it.
+# the active tab renamed, and THREE labelled panes.
+#
+#   +-----------------+--------+
+#   |                 | tool   |  agent   $AGENT_LAYOUT_RATIO of the width
+#   |      agent      | lazygit|  tool    $AGENT_LAYOUT_TOOL_RATIO of the rest
+#   |                 +--------+  shell   whatever the tool pane leaves
+#   |                 | shell  |
+#   +-----------------+--------+
 #
 # The recipe the plugin's event hook runs on worktree.created, which the UI
 # new_worktree action was measured to emit. It is kept separate so it can also
@@ -19,11 +26,56 @@
 # Safe to run again: it refuses to touch a tab that already has more than one
 # pane or already hosts an agent.
 #
+# --- how Herdr behaviour below was measured ---------------------------------
+#
+# Several claims in this file are measured against 0.8.2 rather than documented.
+# All of them were taken in an ISOLATED server, never in the live one, because a
+# probe split or rename in the live server disturbs the workspaces being worked
+# in. The isolation lever is XDG_CONFIG_HOME, paired with --session:
+#
+#   rm -rf /private/tmp/hgeo && mkdir -p /private/tmp/hgeo
+#   XDG_CONFIG_HOME=/private/tmp/hgeo herdr --session geo server &
+#
+# XDG_CONFIG_HOME moves Herdr's ENTIRE config root — the socket, plugins.json
+# and session.json together. Two near misses are worth writing down, because
+# both look like isolation and are not:
+#
+#   HERDR_SOCKET_PATH moves ONLY the socket. A server started that way restores
+#   the LIVE session.json, runs the user's real workspaces in a second process,
+#   and writes its own state back over theirs. Measured 2026-09-08: a throwaway
+#   workspace created in such a server appeared in the live ~/.config/herdr/
+#   session.json. The live server happened to overwrite it minutes later, which
+#   is luck and not a safety property.
+#
+#   HERDR_CONFIG_PATH isolates NOTHING. It moves neither the socket nor the
+#   state, whether it names a directory or a file.
+#
+# Keep the config root SHORT, under /private/tmp rather than a deep scratch
+# path: startup dies with "local socket name length exceeds capacity of
+# sun_path of sockaddr_un".
+#
+# Verify isolation three ways BEFORE probing anything, because the failure is
+# silent: `workspace list` must return zero workspaces (a shared session.json
+# restores the live ones, which is the tell), `plugin list` must show only what
+# was linked, and the live plugins.json must be byte-identical by sha256 and
+# mtime afterwards.
+#
+# Unrelated to the layout but measured in the same sitting, and the reason no
+# re-register step is documented anywhere here: the server re-reads
+# herdr-plugin.toml FROM DISK at dispatch time and never consults plugins.json
+# for dispatch. A manifest edit takes effect on the very next event, with no
+# re-link, no restart and no reload-config. That cuts both ways — a broken or
+# deleted manifest silently stops all dispatch just as immediately. The registry
+# only records which directories are plugins and whether each is enabled, and it
+# is keyed by PATH, so moving this checkout breaks the link while renaming the
+# id in the manifest does not. `plugin disable` is the one thing it truly owns.
+#
 # POSIX sh, not bash: the manifest declares linux as well as macos, and a minimal
-# Linux image ships /bin/sh as dash. Nothing below is a bashism. `pipefail` went
-# with the shebang and is not missed — both pipelines below end in a python that
-# dereferences the JSON it was piped, so a failed herdr leaves empty stdin and
-# python exits non-zero on its own.
+# Linux image ships /bin/sh as dash. Nothing below is a bashism, checked by
+# running this file under a real dash and not only by reading it. `pipefail`
+# went with the shebang and is not missed — EVERY pipeline below ends in a
+# python that dereferences the JSON it was piped, so a failed herdr leaves empty
+# stdin and python exits non-zero on its own.
 set -eu
 
 # --- how the target is chosen -----------------------------------------------
@@ -75,12 +127,22 @@ die() { say "$*"; exit 1; }
 # Read here rather than inherited from bin/on-event, because a keybinding press
 # never passes through that file. bin/config-env locates the config directory
 # for both entry paths and applies the defaults, so this script only consumes
-# the answer: AGENT_LAYOUT_KIND, _DIRECTION, _RATIO, _TAB_NAME (_RECIPE belongs
-# to bin/on-event, which decides what to exec before this file is reached).
+# the answer: AGENT_LAYOUT_KIND, _DIRECTION, _RATIO, _TAB_NAME, _TOOL_COMMAND,
+# _TOOL_DIRECTION, _TOOL_RATIO, _AGENT_LABEL, _TOOL_LABEL and _SHELL_LABEL
+# (_RECIPE belongs to bin/on-event, which decides what to exec before this file
+# is reached).
 #
-# The values go straight into herdr's argv, never into a shell string, so a
-# hostile .env cannot inject a command. A nonsense value is Herdr's to reject,
-# and the die messages below quote it so the toast names the setting at fault.
+# The values go straight into herdr's argv, never into a string this script
+# evaluates, so nothing in the .env is executed HERE. A nonsense value is
+# Herdr's to reject, and the die messages below quote it so the toast names the
+# setting at fault.
+#
+# One value does reach a shell, one layer further out: `pane run` types
+# AGENT_LAYOUT_TOOL_COMMAND into the tool pane's own shell, which is what makes
+# a command with flags work. So it is shell text by design, exactly as
+# AGENT_LAYOUT_RECIPE is an arbitrary executable by design. Both trust the .env,
+# which is user-owned config in the plugin's config directory and not input off
+# the wire.
 PLUGIN_ROOT="${HERDR_PLUGIN_ROOT:-$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)}"
 settings="$("$PY" "$PLUGIN_ROOT/bin/config-env")" \
     || die "cannot read the plugin settings from $PLUGIN_ROOT"
@@ -128,13 +190,93 @@ eval "$info"
 "$HERDR" tab rename "$TAB" "$AGENT_LAYOUT_TAB_NAME" >/dev/null \
     || die "$LABEL: could not rename the tab to \"$AGENT_LAYOUT_TAB_NAME\""
 
-# The split puts the NEW pane after $PANE, so $PANE stays first and the agent
-# below lands there: agent left, bare shell right, or agent above and shell
-# below with AGENT_LAYOUT_DIRECTION=down. Not a bug to fix. --no-focus keeps the
-# cursor on the agent rather than the new shell.
-"$HERDR" pane split --pane "$PANE" --direction "$AGENT_LAYOUT_DIRECTION" \
-    --ratio "$AGENT_LAYOUT_RATIO" --cwd "$CWD" --no-focus >/dev/null \
+# --- the two splits ----------------------------------------------------------
+#
+# WHICH SIDE DOES --ratio SIZE? Measured 2026-09-08 against 0.8.2 in the
+# isolated server described at the top of this file, because Herdr does not say:
+# `herdr --skill` never mentions --ratio, and `herdr api schema --json` types
+# PaneSplitParams.ratio as a bare float with no description. The old 0.5 default
+# could not reveal it either, since a half split looks identical either way.
+#
+#   split right --ratio 0.7  ->  original pane 66 of 94 cols (0.702), new 0.298
+#   split down  --ratio 0.6  ->  original pane 23 of 39 rows (0.590), new 0.410
+#
+# So --ratio is the share kept by the pane named in --pane, and the NEW pane
+# gets 1 - ratio. Both directions agree. Read every ratio setting here as "how
+# much the pane being split keeps".
+#
+# The split also puts the NEW pane after $PANE, so $PANE stays first and the
+# agent below lands there. --no-focus keeps the cursor on the agent rather than
+# following each new pane.
+#
+# `pane split` answers with the pane it created. That is the only way to learn
+# the id — it is not derivable from $PANE — and the second split needs the first
+# one's answer. Documented on 0.8.2 as `.result.pane`, measured as
+# `.result.pane.pane_id`. Same pipeline discipline as the two reads above: the
+# python dereferences the JSON it was piped, so a failed herdr leaves empty
+# stdin and python exits non-zero on its own, with no need for pipefail.
+split_pane() {
+    "$HERDR" pane split --pane "$1" --direction "$2" --ratio "$3" \
+        --cwd "$CWD" --no-focus 2>/dev/null | "$PY" -c '
+import json, sys
+sys.stdout.write(json.load(sys.stdin)["result"]["pane"]["pane_id"])
+' 2>/dev/null
+}
+
+TOOL_PANE="$(split_pane "$PANE" "$AGENT_LAYOUT_DIRECTION" "$AGENT_LAYOUT_RATIO")" \
     || die "$LABEL: could not split the pane ($AGENT_LAYOUT_DIRECTION, ratio $AGENT_LAYOUT_RATIO)"
+
+# The second split divides the pane the first one made, so the tool pane keeps
+# the leading share and the bare shell takes the remainder beneath it.
+SHELL_PANE="$(split_pane "$TOOL_PANE" "$AGENT_LAYOUT_TOOL_DIRECTION" "$AGENT_LAYOUT_TOOL_RATIO")" \
+    || die "$LABEL: could not split the tool pane ($AGENT_LAYOUT_TOOL_DIRECTION, ratio $AGENT_LAYOUT_TOOL_RATIO)"
+
+# --- fill and label the panes -------------------------------------------------
+#
+# Everything from here on is NON-FATAL, and that is deliberate. The tab now
+# holds three panes, so the guard above turns a later run into a no-op: dying
+# here would report a layout that was in fact built, and no rerun could finish
+# it. The tab rename above is fatal for the mirror-image reason — it happens
+# before any structural change, so the workspace is left clean for a retry.
+# `say` still reaches the user, as a Herdr toast and in the plugin command log.
+#
+# AGENT_LAYOUT_TOOL_COMMAND is one argument, not a word-split list, which is how
+# Herdr's own docs use it (`herdr pane run <id> "just test"`). `pane run` types
+# the text into the pane's shell and presses Enter, so the shell does the
+# parsing and a command with flags works unquoted in the .env.
+#
+# That is also why the default is a BARE `lazygit` rather than an absolute path,
+# against the rule the README states for /bin/sh and /usr/bin/python3. Those are
+# spelled absolutely because Herdr's launchd server spawns them with
+# PATH=/usr/bin:/bin:/usr/sbin:/sbin. A pane's shell is interactive and sources
+# the user's rc files instead. Measured 2026-09-08: `command -v lazygit` run
+# through `pane run` answered /opt/homebrew/bin/lazygit. A bare name is also the
+# only portable default, since the manifest declares linux as well as macos.
+"$HERDR" pane run "$TOOL_PANE" "$AGENT_LAYOUT_TOOL_COMMAND" >/dev/null 2>&1 \
+    || say "$LABEL: panes are laid out, but \"$AGENT_LAYOUT_TOOL_COMMAND\" would not run"
+
+# Pane labels and agents are INDEPENDENT fields, so labelling the agent's pane
+# is not wasted. Measured 2026-09-08 on 0.8.2, with
+# ui.show_agent_labels_on_pane_borders = true: before the rename the agent pane
+# reported agent="claude" and no label at all; after it, agent="claude" AND
+# label="agent", both still set 6s later. `pane rename` writes `label`, and
+# `agent start` writes `agent`. Neither clears the other.
+#
+# What that setting then draws on the border is a CLIENT render choice, and a
+# headless server cannot observe it — so this is measured at the data layer
+# only. It is a real key, not a guess: `herdr config check` accepts
+# ui.show_agent_labels_on_pane_borders and names any key it does not know.
+#
+# Written out rather than looped over "$pane:$label" pairs: a pane id is itself
+# colon-separated (w1:p1), so packing the two into one word and splitting on the
+# colon reads the id as the pane and the pane number as the label.
+label_pane() {
+    "$HERDR" pane rename "$1" "$2" >/dev/null 2>&1 \
+        || say "$LABEL: could not label pane $1 \"$2\""
+}
+label_pane "$PANE" "$AGENT_LAYOUT_AGENT_LABEL"
+label_pane "$TOOL_PANE" "$AGENT_LAYOUT_TOOL_LABEL"
+label_pane "$SHELL_PANE" "$AGENT_LAYOUT_SHELL_LABEL"
 
 # Herdr agent names are [a-z][a-z0-9_-]{0,31}. Taken from the workspace label so
 # `herdr agent prompt <label>` reaches it. Deliberately NOT deduped against live
@@ -173,7 +315,7 @@ NAME="$(printf '%s' "$NAME" | cut -c1-32)"
 # measured fix — see README, "Known limitation".
 if start_err="$("$HERDR" agent start "$NAME" --kind "$AGENT_LAYOUT_KIND" \
         --pane "$PANE" 2>&1 >/dev/null)"; then
-    say "$LABEL: $AGENT_LAYOUT_KIND started as \"$NAME\", shell split $AGENT_LAYOUT_DIRECTION, tab named $AGENT_LAYOUT_TAB_NAME"
+    say "$LABEL: $AGENT_LAYOUT_KIND started as \"$NAME\", $AGENT_LAYOUT_TOOL_COMMAND $AGENT_LAYOUT_TOOL_DIRECTION beside it, tab named $AGENT_LAYOUT_TAB_NAME"
     exit 0
 fi
 
@@ -185,4 +327,4 @@ case "$start_err" in
 esac
 
 printf '%s\n' "$start_err" >&2
-die "$LABEL: split done, but $AGENT_LAYOUT_KIND did not start as \"$NAME\""
+die "$LABEL: panes laid out, but $AGENT_LAYOUT_KIND did not start as \"$NAME\""

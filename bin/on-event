@@ -3,8 +3,9 @@
 # workspace, then hands off to the layout recipe unchanged.
 #
 # It contains NO layout logic on purpose. bin/agent-layout owns the recipe (tab
-# renamed, agent in one pane, a bare shell beside it) and owns the "already laid
-# out?" guard. This file only answers "is this the event, and is it safe?".
+# renamed, then three labelled panes: the agent, a tool pane running lazygit,
+# and a bare shell) and owns the "already laid out?" guard. This file only
+# answers "is this the event, and is it safe?".
 #
 # Herdr runs its server under launchd with PATH=/usr/bin:/bin:/usr/sbin:/sbin
 # (verified against the live process, 2026-09-05). /opt/homebrew is NOT on it —
