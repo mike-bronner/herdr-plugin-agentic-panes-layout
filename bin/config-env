@@ -1,44 +1,11 @@
 #!/usr/bin/python3
-"""Print this plugin's settings as shell assignments, with defaults applied.
-
-Both halves of the plugin read their settings through here, so the .env parsing
-rules live in exactly one place:
-
-    eval "$(/usr/bin/python3 "$PLUGIN_ROOT/bin/config-env")"
-
-bin/on-event needs AGENT_LAYOUT_RECIPE. bin/agent-layout needs the other ten.
-bin/agent-layout is also reachable straight from a keybinding, which never
-passes through bin/on-event and sees a different environment entirely (see
-config_dir below). One reader covers all three callers.
-
-Every value is shlex-quoted, so a tab name containing a space survives the eval.
-
-Nothing here validates a value beyond "is it set". Herdr's own CLI already
-rejects a bad --direction, --ratio or --kind with a named error, and
-bin/agent-layout reports that error. A second copy of Herdr's enumerations
-here would only go stale the next time Herdr adds an agent kind.
-"""
 import os
 import shlex
 import subprocess
 import sys
 
-# Must match the id in herdr-plugin.toml. `herdr plugin config-dir` is keyed on
-# it, so a drift between the two would silently read a different .env.
-# tests/test_on_event.py pins the two together.
 PLUGIN_ID = "mikebronner.agentic-panes-layout"
 
-# Every setting, with the behaviour that was hardcoded before it became one.
-# An unset key and an empty key both mean "default": an .env line reading
-# `AGENT_LAYOUT_KIND=` is indistinguishable from a missing one, and treating it
-# as "no agent kind at all" would only produce a confusing Herdr error.
-#
-# The layout is TWO splits, so each split owns a direction and a ratio. The
-# unprefixed pair is the first split (agent against the rest); the _TOOL_ pair
-# is the second (the tool pane against the bare shell below it).
-#
-# Both ratios name the share kept by the pane BEING SPLIT, which is measured,
-# not assumed — see the comment above the splits in bin/agent-layout.
 DEFAULTS = {
     "AGENT_LAYOUT_KIND": "claude",
     "AGENT_LAYOUT_DIRECTION": "right",
@@ -55,12 +22,6 @@ DEFAULTS = {
 
 
 def load_env(path):
-    """Apply KEY=VALUE lines from `path` to os.environ. Real env vars win.
-
-    Blank lines and lines starting with "#" are skipped, and so is any line
-    without an "=". The skip is deliberate: the file is optional user config,
-    so a typo must never stop a worktree from being laid out.
-    """
     try:
         with open(path, encoding="utf-8") as f:
             text = f.read()
@@ -79,30 +40,10 @@ def load_env(path):
 
 
 def config_dir():
-    """The directory holding this plugin's .env, or None if it cannot be found.
-
-    Herdr injects HERDR_PLUGIN_CONFIG_DIR into plugin commands, so the event
-    hook is simply told where to look.
-
-    A [[keys.command]] press is NOT told. Measured on 0.8.2, a keybinding shell
-    command is handed HERDR_ACTIVE_WORKSPACE_ID, HERDR_ACTIVE_TAB_ID,
-    HERDR_ACTIVE_PANE_ID, HERDR_ACTIVE_PANE_CWD, HERDR_BIN_PATH,
-    HERDR_SOCKET_PATH and HERDR_SESSION, and no HERDR_PLUGIN_* at all. So ask
-    Herdr for the answer rather than assembling
-    ~/.config/herdr/plugins/config/<id> by hand: that is an internal layout, and
-    HERDR_CONFIG_PATH can move it.
-
-    Returning None is not an error. It means "no file", which yields the
-    documented defaults, which is what an uninstalled config directory should
-    produce anyway.
-    """
     injected = os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
     if injected:
         return injected
 
-    # Same fallback as bin/agent-layout: Herdr's server runs under launchd with
-    # PATH=/usr/bin:/bin:/usr/sbin:/sbin, so /opt/homebrew is not on the PATH
-    # and a bare `herdr` does not resolve.
     herdr = os.environ.get("HERDR_BIN_PATH") or "/opt/homebrew/bin/herdr"
     try:
         done = subprocess.run([herdr, "plugin", "config-dir", PLUGIN_ID],

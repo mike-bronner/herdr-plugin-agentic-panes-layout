@@ -41,16 +41,16 @@ nothing else:
 
 1. Is this the event that means a worktree was made? Only `worktree.created` is
    acted on. `worktree.opened` is subscribed as well, but only so that Herdr
-   logs it while a design question is settled. See the comments in
-   `herdr-plugin.toml`.
+   logs it while a design question is settled. That question, and the condition
+   that resolves it, are in [`docs/open-questions.md`](docs/open-questions.md).
 2. Is the new workspace the focused one? `herdr worktree create --no-focus`
    emits `worktree.created` with `"focused": false`, and laying out an unfocused
    workspace would start an agent in whatever you were looking at instead.
 
-If both answers are yes it hands off to `bin/agent-layout`, which applies the
-recipe to the focused workspace: rename the tab, split the single pane in two,
-split the new pane again, run lazygit in the upper one, label all three, and
-start the agent in the original pane.
+If both answers are yes it hands off to `bin/agent-layout` with no arguments,
+which applies the recipe to the focused workspace: rename the tab, split the
+single pane in two, split the new pane again, run lazygit in the upper one,
+label all three, and start the agent in the original pane.
 
 `bin/agent-layout` is safe to run again. It refuses to touch a tab that already
 has more than one pane, or whose pane already hosts an agent, so a second run is
@@ -78,6 +78,57 @@ command = "/absolute/path/to/herdr-plugin-agentic-panes-layout/bin/agent-layout"
 The absolute path is required. A `[[keys.command]]` process is handed
 `HERDR_ACTIVE_*`, `HERDR_BIN_PATH`, `HERDR_SOCKET_PATH` and `HERDR_SESSION`, and
 no `HERDR_PLUGIN_ROOT` to resolve a relative path against.
+
+## Arguments
+
+With **no arguments**, `bin/agent-layout` does exactly what the two sections
+above describe: the focused workspace, an agent name derived from that
+workspace's label, and an agent started. The event hook execs it that way and the
+keybinding presses it that way, so that behaviour is fixed.
+
+Two optional flags exist for a third caller, another program running this file
+as an executable:
+
+```sh
+bin/agent-layout [--workspace <id>] [--agent-name <name>]
+```
+
+`--workspace <id>` lays out the workspace with that id rather than the focused
+one. "Which workspace is focused?" is the right question for the hook and the
+keybinding, which both mean the workspace you are looking at, and the wrong one
+for a caller that opens several workspaces unfocused and picks a focus target at
+the end. Nothing else changes: the tab, the label and the working directory are
+all read off the workspace named here.
+
+`--agent-name <name>` starts the agent under that exact name, instead of one
+derived from the workspace label. The name reaches Herdr **verbatim**, so it is
+not lowercased, not prefixed and not truncated. A caller that reserves distinct
+names across a batch of workspaces does so precisely so that
+`herdr agent prompt <name>` reaches each one, and re-deriving the string here
+would break the guarantee the reservation was made for. An invalid name is
+Herdr's to reject, and the refusal is reported as a toast.
+
+There is no flag to skip the agent. The first pane always holds the preferred
+agent. A caller that must not block on `agent start` detaches the whole
+`bin/agent-layout` call and passes `--agent-name`, which gets the panes, the
+reserved name and no blocking wait together.
+
+These are per-call arguments and deliberately **not** settings, so neither has an
+`AGENT_LAYOUT_` equivalent. Those settings are one shared vocabulary, so a value
+means the same thing wherever it is read. A per-call argument hiding among them
+would let a stray `export` in an interactive shell silently retarget a keybinding
+press.
+
+Every argument error is fatal, and is reported before anything is read or
+changed: an unknown flag, a flag missing its value, a flag given an empty value,
+and the same flag given twice. A `--workspace` id that matches no workspace is
+fatal too, rather than falling back to the focused one. That fallback would lay
+out whatever you happened to be looking at, which is the accident the flag exists
+to prevent.
+
+The "already laid out?" guard applies either way. It reads the pane count of the
+workspace being laid out, so a second run against the same target is a no-op
+whichever way it was reached.
 
 ## Configure
 
@@ -183,35 +234,22 @@ check is skipped and the run prints a banner saying so, because a green suite
 there is not a checked manifest. Run the suite under a 3.11 or newer
 interpreter to include it.
 
-## Measuring Herdr behaviour
+## Documentation
 
-Several comments in `bin/agent-layout` record behaviour that Herdr does not
-document, such as which side `--ratio` sizes. Measure such things in an
-**isolated server**, never in the live one, or a probe split will rearrange the
-workspaces you are working in.
+The scripts and the manifest carry no comments. Everything that would have been
+one lives in `docs/`:
 
-```sh
-rm -rf /private/tmp/hgeo && mkdir -p /private/tmp/hgeo
-XDG_CONFIG_HOME=/private/tmp/hgeo herdr --session geo server &
-```
+- [`docs/design.md`](docs/design.md) — why the code in `bin/` is shaped as it is.
+  The entry paths, the arguments, the guard, the fatal versus non-fatal split,
+  and the settings contract.
+- [`docs/herdr-behaviour.md`](docs/herdr-behaviour.md) — Herdr behaviour this
+  plugin depends on that Herdr does not document, such as which side `--ratio`
+  sizes. Every entry is dated and attributed. **Read the measurement method
+  there before probing anything**: measure in an isolated server, never in the
+  live one, or a probe split will rearrange the workspaces you are working in.
+- [`docs/open-questions.md`](docs/open-questions.md) — decisions deliberately not
+  taken yet, each with the condition that resolves it. The `worktree.opened`
+  subscription is the open one.
 
-`XDG_CONFIG_HOME` moves Herdr's entire config root, so the socket, `plugins.json`
-and `session.json` all move together. Pair it with `--session`, because an
-ambient `HERDR_SOCKET_PATH` may already point at the live socket. Keep the path
-short, under `/private/tmp`, or startup dies on `sun_path` length.
-
-Two near misses look like isolation and are not. `HERDR_SOCKET_PATH` moves only
-the socket, so the server restores the **live** `session.json`, runs your real
-workspaces in a second process, and writes its state back over yours.
-`HERDR_CONFIG_PATH` isolates nothing at all.
-
-Check isolation three ways before probing, because the failure is silent.
-`workspace list` must return nothing, `plugin list` must show only what you
-linked, and the live `plugins.json` must be byte-identical afterwards by sha256
-and mtime.
-
-There is no re-register step. The server re-reads `herdr-plugin.toml` from disk
-at dispatch time and never consults `plugins.json` for dispatch, so a manifest
-edit takes effect on the very next event with no re-link, restart or
-`reload-config`. The cached version string there is cosmetic. This cuts both
-ways: a broken or deleted manifest stops all dispatch just as immediately.
+Every measurement recorded there was taken against Herdr 0.8.2. Treat each as
+"true of 0.8.2" rather than "true today".

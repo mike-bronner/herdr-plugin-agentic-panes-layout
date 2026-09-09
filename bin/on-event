@@ -1,69 +1,16 @@
 #!/bin/sh
-# on-event — the plugin body. Decides whether this event should lay out a
-# workspace, then hands off to the layout recipe unchanged.
-#
-# It contains NO layout logic on purpose. bin/agent-layout owns the recipe (tab
-# renamed, then three labelled panes: the agent, a tool pane running lazygit,
-# and a bare shell) and owns the "already laid out?" guard. This file only
-# answers "is this the event, and is it safe?".
-#
-# Herdr runs its server under launchd with PATH=/usr/bin:/bin:/usr/sbin:/sbin
-# (verified against the live process, 2026-09-05). /opt/homebrew is NOT on it —
-# the trap that killed four third-party plugins. Nothing below needs it: sh is
-# /bin/sh, python3 is spelled absolutely, and bin/agent-layout resolves the herdr
-# binary from HERDR_BIN_PATH, which Herdr injects.
 set -eu
 
-# --- gate 1: the right event ------------------------------------------------
-#
-# No longer redundant. The manifest now also subscribes worktree.opened, as
-# temporary instrumentation with a stated exit condition. This compare is what
-# makes that subscription log-only for free: Herdr records every event it
-# spawns us for, and this line exits before any layout runs.
-#
-# That is the whole reason the gate was kept when the manifest was cut to one
-# event. It makes adding a subscription a no-op instead of a bug. The manifest
-# explains why a second ACTING event is dangerous — the events fire 1ms apart,
-# Herdr does not serialize hooks, and bin/agent-layout's guard reads pane count
-# over the API, so two concurrent copies would both split the pane. Promoting
-# worktree.opened means editing this line on purpose, with the manifest's exit
-# condition read first.
 [ "${HERDR_PLUGIN_EVENT:-}" = "worktree.created" ] || exit 0
 
-# --- gate 2: the new workspace is the focused one ----------------------------
-#
-# bin/agent-layout deliberately targets whatever workspace is FOCUSED rather
-# than reading its caller's environment. That is correct when the new worktree
-# has focus, and wrong when it does not: `herdr worktree create --no-focus` was
-# measured to emit worktree.created with "focused": false, which would aim the
-# layout at whatever Mike is looking at and start Claude in it.
-#
-# So fail closed. Any missing key or malformed payload raises, python exits
-# non-zero, and this hook does nothing rather than laying out a stranger.
 /usr/bin/python3 -c '
 import json, os, sys
 ws = json.loads(os.environ["HERDR_PLUGIN_EVENT_JSON"])["data"]["workspace"]
 sys.exit(0 if ws.get("focused") else 1)
 ' || exit 0
 
-# --- where the recipe lives ---------------------------------------------------
-#
-# The recipe ships inside the plugin, so it travels with an install. Herdr
-# injects HERDR_PLUGIN_ROOT into plugin commands, which is the answer whenever
-# this file runs for real. The fallback derives the root from this script's own
-# location, which keeps the hook runnable straight out of a checkout — by the
-# test suite, and by hand — where nothing injects anything.
 PLUGIN_ROOT="${HERDR_PLUGIN_ROOT:-$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)}"
 
-# --- settings -----------------------------------------------------------------
-#
-# Only AGENT_LAYOUT_RECIPE is consumed here. bin/agent-layout reads the layout
-# settings itself, because a keybinding press reaches it without passing through
-# this file at all.
-#
-# A failure to read the settings is fatal rather than "use the defaults": if the
-# user pointed AGENT_LAYOUT_RECIPE somewhere, silently running the bundled
-# recipe instead would be the wrong layout applied without a word.
 settings="$(/usr/bin/python3 "$PLUGIN_ROOT/bin/config-env")" || {
     printf 'agent-layout: cannot read the plugin settings from %s\n' "$PLUGIN_ROOT" >&2
     exit 1
@@ -73,20 +20,10 @@ eval "$settings"
 RECIPE="$PLUGIN_ROOT/bin/agent-layout"
 if [ -n "$AGENT_LAYOUT_RECIPE" ]; then
     RECIPE="$AGENT_LAYOUT_RECIPE"
-    # A recipe that is named but not runnable is a broken setting, not "this
-    # event was not mine". Fail loudly: Herdr records the exit code and this
-    # line in the plugin command log, which is the only place a user will see
-    # it. `herdr plugin log list --plugin mikebronner.agentic-panes-layout`.
     [ -x "$RECIPE" ] || {
         printf 'agent-layout: AGENT_LAYOUT_RECIPE is not executable: %s\n' "$RECIPE" >&2
         exit 1
     }
 fi
 
-# --- hand off ----------------------------------------------------------------
-#
-# exec, so the recipe owns the exit code and stderr: Herdr records both in the
-# plugin command log, which is where its "left alone" / failure messages become
-# readable. Herdr does not block on event hooks (a 5s hook was measured not to
-# delay the next API call), so there is no reason to detach.
 exec "$RECIPE"

@@ -8,18 +8,57 @@ these: bin/on-event's entire job is which process it does or does not exec, and
 bin/agent-layout's entire job is which herdr commands it does or does not run.
 Stubbing the exec target and the herdr binary is what makes both observable
 without splitting a real pane.
+
+The scripts and the manifest carry no comments. The reasoning behind the code
+under test lives in docs/design.md, the measured Herdr behaviour it relies on
+lives in docs/herdr-behaviour.md, and the one decision still open lives in
+docs/open-questions.md. NoComments at the foot of this file keeps them that way.
+
+Fixtures and constants
+----------------------
+
+LAUNCHD_PATH is the PATH Herdr's server really runs with, so the tests run with
+it too. A script that only works because of the developer's PATH is a script
+that fails in production.
+
+EXPECTED_EVENTS is the manifest's subscription list, in file order. OPENED is
+temporary instrumentation: when its exit condition is met it is either promoted
+into gate 1 or deleted, and this list changes with it. The exit condition is in
+docs/open-questions.md and must be read before that list is touched.
+
+DEFAULTS is the settings bin/config-env is contracted to emit, with the
+behaviour that was hardcoded before each became a setting. Pinned here rather
+than read from the script, so a silently changed default reddens.
+
+STUB_HERDR stands in for the herdr CLI. It records every invocation to
+$STUB_LOG, answers the two list calls from fixture files, and takes its
+`agent start` outcome from the environment, so a test can pick success,
+agent_not_ready, or a real failure.
+
+`pane split` is the one call with a real answer to model. The recipe reads the
+new pane's id back out of it, and the SECOND split targets the pane the FIRST
+one returned, so the stub hands out a fresh id each time rather than a fixed
+one. It counts calls in a file and answers p2 then p3, which is what lets a test
+tell the two panes apart. STUB_SPLIT_STATUS fails the first split and
+STUB_SPLIT2_STATUS the second, so each can be exercised on its own.
+
+There are two logs, because "$*" flattens argv. `pane rename p2 "my tool"` and
+`pane rename p2 my tool` are the same line in $STUB_LOG and different lines in
+$STUB_ARGV_LOG, which is the only way to pin that a label with a space stays ONE
+argument. $STUB_LOG stays because it keeps the ordinary assertions readable.
+
+The tomllib banner
+------------------
+
+ManifestIsValidToml parses herdr-plugin.toml for real, which needs tomllib,
+added in Python 3.11. The interpreter this plugin targets is /usr/bin/python3,
+which PY pins for the same reason bin/config-env's shebang spells it: it is the
+one Herdr's launchd server can reach. On macOS it is 3.9, so the check has to be
+skippable. A skip that reads as a pass would be worse than no check at all,
+hence the banner printed once at import, on stderr.
 """
 import json, os, re, stat, subprocess, sys, tempfile, unittest
 
-# ManifestIsValidToml at the foot of this file parses herdr-plugin.toml for
-# real, which needs tomllib — added in Python 3.11. The interpreter this plugin
-# targets is /usr/bin/python3, which PY below pins for the same reason
-# bin/config-env's shebang spells it: it is the one Herdr's launchd server can
-# reach. On macOS it is 3.9, so the check has to be skippable.
-#
-# A skip that reads as a pass would be worse than no check at all, hence the
-# banner: it is printed once, at import, on stderr, so no green run can be
-# mistaken for a checked manifest.
 try:
     import tomllib
 except ModuleNotFoundError:
@@ -47,22 +86,13 @@ CONFIG_ENV = os.path.join(ROOT, "bin", "config-env")
 MANIFEST = os.path.join(ROOT, "herdr-plugin.toml")
 
 PY = "/usr/bin/python3"
-# Herdr's server runs under launchd with exactly this PATH, so the tests run
-# with it too: a script that only works because of the developer's PATH is a
-# script that fails in production.
 LAUNCHD_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 
 CREATED = "worktree.created"
-OPENED = "worktree.opened"  # subscribed, but log-only by design
+OPENED = "worktree.opened"
 
-# The subscription list the manifest is pinned to, in file order. OPENED is
-# temporary instrumentation — when its exit condition is met it is either
-# promoted into gate 1 or deleted, and this list changes with it.
 EXPECTED_EVENTS = [CREATED, OPENED]
 
-# The settings bin/config-env is contracted to emit, with the behaviour that was
-# hardcoded before each became a setting. Pinned here, not read from the script,
-# so a silently changed default reddens.
 DEFAULTS = {
     "AGENT_LAYOUT_KIND": "claude",
     "AGENT_LAYOUT_DIRECTION": "right",
@@ -77,22 +107,6 @@ DEFAULTS = {
     "AGENT_LAYOUT_RECIPE": "",
 }
 
-# Stand-in for the herdr CLI. Records every invocation to $STUB_LOG, answers the
-# two list calls from fixture files, and takes its `agent start` outcome from the
-# environment so a test can pick success, agent_not_ready, or a real failure.
-#
-# `pane split` is the one call with a real answer to model. The recipe reads the
-# new pane's id back out of it, and the SECOND split targets the pane the FIRST
-# one returned, so the stub has to hand out a fresh id each time rather than a
-# fixed one. It counts calls in a file and answers p2 then p3, which is what lets
-# a test tell the two panes apart. STUB_SPLIT_STATUS fails the first split and
-# STUB_SPLIT2_STATUS the second, so each can be exercised on its own.
-#
-# Two logs, because "$*" flattens argv. `pane rename p2 "my tool"` and
-# `pane rename p2 my tool` are the same line in $STUB_LOG and different lines in
-# $STUB_ARGV_LOG, which is the only way to pin that a label with a space stays
-# ONE argument. $STUB_LOG stays because it keeps the ordinary assertions
-# readable.
 STUB_HERDR = """#!/bin/sh
 printf '%s\\n' "$*" >> "$STUB_LOG"
 for a in "$@"; do printf '[%s]' "$a" >> "$STUB_ARGV_LOG"; done
@@ -118,6 +132,13 @@ case "$1 $2" in
         ;;
     "notification show") : ;;
     "agent start")
+        for taken in ${STUB_TAKEN_NAMES:-}; do
+            if [ "$3" = "$taken" ]; then
+                printf '{"error":{"code":"agent_name_taken","message":"stub"}\
+,"id":"cli:agent:start"}\\n' >&2
+                exit 1
+            fi
+        done
         if [ -n "${STUB_AGENT_STDERR:-}" ]; then
             printf '%s\\n' "$STUB_AGENT_STDERR" >&2
         fi
@@ -189,6 +210,19 @@ class TempPluginCase(unittest.TestCase):
                 "STUB_ARGV_LOG": self.argv_log,
                 "STUB_SPLIT_COUNT": os.path.join(self.tmp.name, "splits")}
 
+    def reset_stub_state(self):
+        """Forget every recorded call and the `pane split` counter.
+
+        For a test that runs the script more than once. Without it the previous
+        run's log answers the assertion, so an assertIn would pass on a case that
+        never really ran, and the split counter would keep counting up and hand
+        out pane ids the second run's assertions do not expect.
+        """
+        for path in (self.log, self.argv_log,
+                     os.path.join(self.tmp.name, "splits")):
+            if os.path.exists(path):
+                os.remove(path)
+
     def read_log(self, path):
         try:
             with open(path) as f:
@@ -204,10 +238,6 @@ class TempPluginCase(unittest.TestCase):
         boundaries are visible rather than flattened by "$*"."""
         return self.read_log(self.argv_log)
 
-
-# ---------------------------------------------------------------------------
-# bin/config-env — the single reader of the .env, for both entry paths
-# ---------------------------------------------------------------------------
 
 class ConfigEnv(TempPluginCase):
     """Every setting reaches both halves of the plugin through this script."""
@@ -336,10 +366,6 @@ class ConfigEnv(TempPluginCase):
         self.assertEqual(got, DEFAULTS)
 
 
-# ---------------------------------------------------------------------------
-# bin/on-event — the two gates, and the choice of recipe
-# ---------------------------------------------------------------------------
-
 class HookCase(TempPluginCase):
     """The hook is run against a stub plugin root, so "it handed off" is
     observable as the stub recipe's output rather than as a split pane.
@@ -356,7 +382,6 @@ class HookCase(TempPluginCase):
         self.stub_recipe = write_script(
             os.path.join(self.root, "bin", "agent-layout"),
             "#!/bin/sh\necho RAN\n")
-        # The real reader, so the settings the hook sees are the real ones.
         os.symlink(CONFIG_ENV, os.path.join(self.root, "bin", "config-env"))
 
     def run_hook(self, event=CREATED, event_json=None, env=None,
@@ -371,7 +396,6 @@ class HookCase(TempPluginCase):
         if event_json is not None:
             e["HERDR_PLUGIN_EVENT_JSON"] = event_json
         e.update(env or {})
-        # The exact command the manifest declares.
         p = subprocess.run(["sh", "bin/on-event"], cwd=ROOT, env=e,
                            capture_output=True, text=True)
         self.assertEqual(p.returncode, expect_status, p.stderr)
@@ -397,7 +421,8 @@ class Gate1Event(HookCase):
 
     def test_worktree_opened_does_not_even_when_focused_and_fresh(self):
         """already_open=false is the payload that will one day justify acting.
-        Until the exit condition in herdr-plugin.toml is settled, it must not."""
+        Until the exit condition in docs/open-questions.md is settled, it must
+        not."""
         self.assertEqual(self.run_hook(OPENED, opened_payload(False)), "")
 
     def test_workspace_created_does_not(self):
@@ -489,10 +514,15 @@ class RecipeSelection(HookCase):
         self.run_hook(CREATED, payload(True), expect_status=1)
         self.assertIn("cannot read the plugin settings", self.stderr)
 
+    def test_the_recipe_is_handed_no_arguments(self):
+        """The no-argument contract. bin/agent-layout's default behaviour is
+        defined as exactly what this hook gets, so the hook must never start
+        passing flags. A recipe that echoes its argv proves the list is empty."""
+        recipe = self.custom_recipe(
+            body="#!/bin/sh\nprintf 'ARGS[%s]\\n' \"$*\"\n")
+        self.write_env("AGENT_LAYOUT_RECIPE=%s\n" % recipe)
+        self.assertEqual(self.run_hook(CREATED, payload(True)), "ARGS[]")
 
-# ---------------------------------------------------------------------------
-# bin/agent-layout — the recipe itself
-# ---------------------------------------------------------------------------
 
 WORKSPACES = {"result": {"workspaces": [
     {"workspace_id": "w9", "active_tab_id": "t1", "label": "proj one",
@@ -501,9 +531,26 @@ WORKSPACES = {"result": {"workspaces": [
 ONE_BARE_PANE = {"result": {"panes": [
     {"pane_id": "p1", "tab_id": "t1", "cwd": "/tmp/proj", "agent": None}]}}
 
+TWO_WORKSPACES = {"result": {"workspaces": [
+    {"workspace_id": "w9", "active_tab_id": "t1", "label": "proj one",
+     "focused": True},
+    {"workspace_id": "w7", "active_tab_id": "t7", "label": "other proj",
+     "focused": False}]}}
+
+ONE_BARE_PANE_IN_T7 = {"result": {"panes": [
+    {"pane_id": "p1", "tab_id": "t7", "cwd": "/tmp/other", "agent": None}]}}
+
 
 class LayoutCase(TempPluginCase):
-    """bin/agent-layout run for real against a stub herdr binary."""
+    """bin/agent-layout run for real against a stub herdr binary.
+
+    TWO_WORKSPACES is the picker's situation, built so that targeting is
+    OBSERVABLE. The workspace --workspace names is deliberately NOT the focused
+    one, and differs from the focused one in every field the layout reads: a
+    different active tab, a different label (so a different derived agent name)
+    and a different cwd. Aiming at the focused workspace by mistake therefore
+    cannot produce a passing run.
+    """
 
     def setUp(self):
         super().setUp()
@@ -520,17 +567,34 @@ class LayoutCase(TempPluginCase):
         with open(self.panes, "w") as f:
             json.dump(doc, f)
 
-    def run_layout(self, env=None, expect_status=0):
+    def run_layout(self, args=(), env=None, expect_status=0):
+        """`args` is the argument list, and defaults to EMPTY on purpose.
+
+        Most tests in this file call this with no arguments, which is what pins
+        the bare invocation bin/on-event and the README's [[keys.command]]
+        example both rely on. A new flag that changed any of those reddens here
+        rather than in production.
+
+        The file is run directly, not via `sh <path>`: the executable bit and
+        the shebang are what bin/on-event's exec and the keybinding both rely on.
+        """
         e = self.base_env()
         e["HERDR_PLUGIN_CONFIG_DIR"] = self.config_dir
         e["STUB_WORKSPACES"] = self.workspaces
         e["STUB_PANES"] = self.panes
         e.update(env or {})
-        # Run the file directly, not via `sh <path>`: the executable bit and the
-        # shebang are what bin/on-event's exec and the keybinding both rely on.
-        p = subprocess.run([LAYOUT], env=e, capture_output=True, text=True)
+        p = subprocess.run([LAYOUT] + list(args), env=e, capture_output=True,
+                           text=True)
         self.assertEqual(p.returncode, expect_status, p.stderr)
         return p.stderr
+
+    def changing_calls(self):
+        """Every stub call that would alter a workspace. The read-only calls
+        (`workspace list`, `pane list`) and the toast are not layout steps, so a
+        refusal is proved by this list being empty rather than the log being."""
+        return [c for c in self.herdr_calls()
+                if c.startswith(("tab rename", "pane split", "pane run",
+                                 "pane rename", "agent start"))]
 
 
 class LayoutApplies(LayoutCase):
@@ -616,8 +680,6 @@ class LayoutApplies(LayoutCase):
             {"workspace_id": "w9", "active_tab_id": "t1",
              "label": "9 Bible/Models", "focused": True}]}})
         self.run_layout()
-        # Lowercased, non-name characters replaced, prefixed because Herdr
-        # requires a leading lowercase letter.
         self.assertIn("agent start a9-bible-models --kind claude --pane p1",
                       self.herdr_calls())
 
@@ -711,10 +773,7 @@ class LayoutGuards(LayoutCase):
             {"pane_id": "p2", "tab_id": "t1", "cwd": "/tmp/proj"}]}})
         err = self.run_layout()
         self.assertIn("active tab has 2 panes, not 1 — left alone", err)
-        self.assertEqual([c for c in self.herdr_calls()
-                          if c.startswith(("tab rename", "pane split",
-                                           "pane run", "pane rename",
-                                           "agent start"))], [])
+        self.assertEqual(self.changing_calls(), [])
 
     def test_a_pane_already_running_an_agent_is_left_alone(self):
         self.set_panes({"result": {"panes": [
@@ -722,10 +781,7 @@ class LayoutGuards(LayoutCase):
              "agent": "claude"}]}})
         err = self.run_layout()
         self.assertIn("pane already runs claude — left alone", err)
-        self.assertEqual([c for c in self.herdr_calls()
-                          if c.startswith(("tab rename", "pane split",
-                                           "pane run", "pane rename",
-                                           "agent start"))], [])
+        self.assertEqual(self.changing_calls(), [])
 
     def test_a_pane_in_another_tab_is_not_counted(self):
         self.set_panes({"result": {"panes": [
@@ -811,9 +867,338 @@ class AgentStartOutcome(LayoutCase):
         self.assertIn("did not start", err)
 
 
-# ---------------------------------------------------------------------------
-# packaging
-# ---------------------------------------------------------------------------
+class ArgumentParsing(LayoutCase):
+    """A bad argument list is refused before anything is read or changed.
+
+    Every case here asserts changing_calls() is empty, which is the point: the
+    parse happens first, so a usage error must cost the caller nothing.
+    Asserting the message alone would pass just as well on a script that dies
+    halfway through a layout it had already half-applied.
+    """
+
+    def test_an_unknown_argument_is_fatal(self):
+        """Fail closed. A caller that misspells a flag must get an error rather
+        than a layout aimed somewhere it did not ask for."""
+        err = self.run_layout(["--workspaces", "w7"], expect_status=1)
+        self.assertIn("unknown argument: --workspaces", err)
+        self.assertEqual(self.changing_calls(), [])
+
+    def test_a_removed_flag_is_rejected_like_any_other_unknown_one(self):
+        """--no-agent was considered and deliberately not built: the first pane
+        always holds the agent. It must read as an unknown flag, not be quietly
+        ignored, or a caller written against the discarded design would silently
+        get an agent it asked not to have."""
+        err = self.run_layout(["--no-agent"], expect_status=1)
+        self.assertIn("unknown argument: --no-agent", err)
+        self.assertEqual(self.changing_calls(), [])
+
+    def test_nothing_is_even_read_before_the_arguments_are_parsed(self):
+        """Stronger than the guard above: not one API call is made, so a usage
+        error cannot leave a workspace half-inspected either."""
+        self.run_layout(["--nope"], expect_status=1)
+        self.assertEqual([c for c in self.herdr_calls()
+                          if not c.startswith("notification show")], [])
+
+    def test_workspace_without_a_value_is_fatal(self):
+        err = self.run_layout(["--workspace"], expect_status=1)
+        self.assertIn("--workspace needs a workspace id", err)
+        self.assertEqual(self.changing_calls(), [])
+
+    def test_an_empty_workspace_id_is_fatal_rather_than_the_focused_one(self):
+        """The fail-open this closes. `--workspace ""` reads as "no id given" to
+        a bare -n test, which would silently lay out the FOCUSED workspace: the
+        one workspace a caller passing --workspace certainly did not mean."""
+        err = self.run_layout(["--workspace", ""], expect_status=1)
+        self.assertIn("--workspace needs a workspace id", err)
+        self.assertEqual(self.changing_calls(), [])
+
+    def test_agent_name_without_a_value_is_fatal(self):
+        err = self.run_layout(["--agent-name"], expect_status=1)
+        self.assertIn("--agent-name needs an agent name", err)
+        self.assertEqual(self.changing_calls(), [])
+
+    def test_an_empty_agent_name_is_fatal_rather_than_the_derived_one(self):
+        err = self.run_layout(["--agent-name", ""], expect_status=1)
+        self.assertIn("--agent-name needs an agent name", err)
+        self.assertEqual(self.changing_calls(), [])
+
+    def test_a_repeated_workspace_is_fatal(self):
+        """Last-wins would hide the caller's own confusion at the one moment it
+        could still be fixed. The two ids differ so that a silently accepted
+        second one would be observable."""
+        err = self.run_layout(["--workspace", "w7", "--workspace", "w9"],
+                              expect_status=1)
+        self.assertIn("--workspace given more than once", err)
+        self.assertEqual(self.changing_calls(), [])
+
+    def test_a_repeated_agent_name_is_fatal(self):
+        err = self.run_layout(["--agent-name", "one", "--agent-name", "two"],
+                              expect_status=1)
+        self.assertIn("--agent-name given more than once", err)
+        self.assertEqual(self.changing_calls(), [])
+
+    def test_a_flag_repeated_with_the_same_value_is_still_fatal(self):
+        """The rule is about the caller not knowing what it asks, so an
+        identical repeat is refused too. Comparing values instead would let
+        `--workspace w7 --workspace w7` through and make the rule depend on a
+        coincidence."""
+        err = self.run_layout(["--workspace", "w7", "--workspace", "w7"],
+                              expect_status=1)
+        self.assertIn("--workspace given more than once", err)
+        self.assertEqual(self.changing_calls(), [])
+
+    def test_both_flags_together_are_not_a_repeat(self):
+        """The repeat check is per flag. Guarding them with one shared variable
+        would reject the picker's own call."""
+        self.set_workspaces(TWO_WORKSPACES)
+        self.set_panes(ONE_BARE_PANE_IN_T7)
+        self.run_layout(["--workspace", "w7", "--agent-name", "reserved-2"])
+        self.assertIn("agent start reserved-2 --kind claude --pane p1",
+                      self.herdr_calls())
+
+
+class WorkspaceTargeting(LayoutCase):
+    """--workspace lays out the workspace it names, focused or not."""
+
+    def setUp(self):
+        super().setUp()
+        self.set_workspaces(TWO_WORKSPACES)
+        self.set_panes(ONE_BARE_PANE_IN_T7)
+
+    def test_no_arguments_still_picks_the_focused_workspace(self):
+        """The bare invocation, on the very fixture that could hide a regression
+        in it. bin/on-event and the keybinding both pass no arguments, so the
+        focused workspace must still win when another one exists to be chosen by
+        mistake. w9's panes live in t1, so the layout stops at the guard, which
+        is itself the proof that w9 and not w7 was resolved."""
+        err = self.run_layout()
+        self.assertIn("proj one: active tab has 0 panes", err)
+        self.assertIn("pane list --workspace w9", self.herdr_calls())
+        self.assertNotIn("pane list --workspace w7", self.herdr_calls())
+
+    def test_the_named_workspace_is_laid_out_though_it_is_not_focused(self):
+        self.run_layout(["--workspace", "w7"])
+        calls = self.herdr_calls()
+        self.assertIn("pane list --workspace w7", calls)
+        self.assertIn("tab rename t7 agent", calls)
+        self.assertIn("pane split --pane p1 --direction right --ratio 0.5"
+                      " --cwd /tmp/other --no-focus", calls)
+
+    def test_the_agent_name_comes_from_the_named_workspaces_label(self):
+        """The derivation reads LABEL, so targeting the wrong workspace would
+        start the agent under the wrong name even if every id were right."""
+        self.run_layout(["--workspace", "w7"])
+        self.assertIn("agent start other-proj --kind claude --pane p1",
+                      self.herdr_calls())
+        self.assertNotIn("agent start proj-one --kind claude --pane p1",
+                         self.herdr_calls())
+
+    def test_an_unknown_workspace_id_is_fatal_and_lays_nothing_out(self):
+        """Falling back to the focused workspace on a stale id would lay out
+        whatever the user happens to be looking at, which is the exact accident
+        --workspace exists to prevent."""
+        err = self.run_layout(["--workspace", "w404"], expect_status=1)
+        self.assertIn('no workspace "w404" in the Herdr server', err)
+        self.assertEqual(self.changing_calls(), [])
+
+    def test_the_unknown_id_message_is_not_the_focused_one(self):
+        """Two different failures. Telling a caller with a stale id that no
+        workspace is focused sends it looking in the wrong place."""
+        err = self.run_layout(["--workspace", "w404"], expect_status=1)
+        self.assertNotIn("cannot read a focused workspace", err)
+
+    def test_no_focused_workspace_does_not_stop_a_targeted_run(self):
+        """The picker's own situation: it opens with --no-focus, so a pass can
+        reach this script with nothing focused at all."""
+        self.set_workspaces({"result": {"workspaces": [
+            {"workspace_id": "w7", "active_tab_id": "t7", "label": "other proj",
+             "focused": False}]}})
+        self.run_layout(["--workspace", "w7"])
+        self.assertIn("agent start other-proj --kind claude --pane p1",
+                      self.herdr_calls())
+
+    def test_the_guard_reads_the_named_workspace_not_the_focused_one(self):
+        """The guard is what makes a second run a no-op, and it must guard the
+        workspace being laid out. Reading the focused workspace's panes instead
+        would re-split a target that is already laid out."""
+        self.set_panes({"result": {"panes": [
+            {"pane_id": "p1", "tab_id": "t7", "cwd": "/tmp/other"},
+            {"pane_id": "p2", "tab_id": "t7", "cwd": "/tmp/other"}]}})
+        err = self.run_layout(["--workspace", "w7"])
+        self.assertIn("other proj: active tab has 2 panes, not 1 — left alone",
+                      err)
+        self.assertEqual(self.changing_calls(), [])
+
+
+class SuppliedAgentName(LayoutCase):
+    """--agent-name replaces the derived name, and is passed through verbatim."""
+
+    def test_the_supplied_name_reaches_agent_start(self):
+        self.run_layout(["--agent-name", "picked-name"])
+        self.assertIn("agent start picked-name --kind claude --pane p1",
+                      self.herdr_calls())
+        self.assertNotIn("agent start proj-one --kind claude --pane p1",
+                         self.herdr_calls())
+
+    def test_the_supplied_name_is_not_normalised(self):
+        """The load-bearing one. The picker reserves an exact string in its batch
+        set so `herdr agent prompt <name>` reaches the workspace, so this script
+        must not lowercase, prefix or truncate it. The derivation would turn each
+        of these into something else, which is why they are the fixture."""
+        for supplied in ("Weird_Name", "9leading", "x" * 40):
+            with self.subTest(supplied=supplied):
+                self.reset_stub_state()
+                self.run_layout(["--agent-name", supplied])
+                self.assertIn(
+                    "agent start %s --kind claude --pane p1" % supplied,
+                    self.herdr_calls())
+
+    def test_the_supplied_name_stays_one_argument(self):
+        """An invalid name is Herdr's to reject, which it can only do if the
+        whole string reaches it as one argv element rather than word-split."""
+        self.run_layout(["--agent-name", "two words"])
+        self.assertIn("[agent][start][two words][--kind][claude][--pane][p1]",
+                      self.herdr_argv())
+
+    def test_a_supplied_name_still_reports_the_layout_it_applied(self):
+        err = self.run_layout(["--agent-name", "picked-name"])
+        self.assertIn('claude started as "picked-name"', err)
+
+    def test_the_name_is_supplied_alongside_a_targeted_workspace(self):
+        """Both flags at once, which is how the picker calls this script: it
+        detaches the whole call with the workspace it opened and the name it
+        reserved."""
+        self.set_workspaces(TWO_WORKSPACES)
+        self.set_panes(ONE_BARE_PANE_IN_T7)
+        self.run_layout(["--workspace", "w7", "--agent-name", "reserved-2"])
+        calls = self.herdr_calls()
+        self.assertIn("tab rename t7 agent", calls)
+        self.assertIn("agent start reserved-2 --kind claude --pane p1", calls)
+
+
+class DerivedNameCollision(LayoutCase):
+    """A DERIVED name that Herdr says is taken is retried with a suffix.
+
+    The Herdr server is the arbiter, not an in-process set: `agent start`
+    answers agent_name_taken to every caller alike, so it also sees a `claude`
+    somebody started by hand and a second process racing this one. That is why
+    the dedupe lives here rather than in a caller.
+
+    The derivation is byte-identical to herdr-plugin-project-finder's
+    agent_name(), suffix included, so the two cannot drift apart.
+    """
+
+    def starts(self):
+        return [c for c in self.herdr_calls() if c.startswith("agent start")]
+
+    def test_a_taken_derived_name_retries_with_a_suffix(self):
+        self.run_layout(env={"STUB_TAKEN_NAMES": "proj-one"})
+        self.assertIn("agent start proj-one-2 --kind claude --pane p1",
+                      self.herdr_calls())
+
+    def test_the_suffix_increments_until_a_free_name_is_found(self):
+        """Also pins that this is a REAL loop that re-reads the error each time,
+        rather than a suffix computed once from the first failure. The exact
+        call sequence is asserted, so a one-shot implementation that jumped
+        straight to -3 would redden even though it found a free name."""
+        self.run_layout(env={"STUB_TAKEN_NAMES": "proj-one proj-one-2"})
+        self.assertEqual(self.starts(), [
+            "agent start proj-one --kind claude --pane p1",
+            "agent start proj-one-2 --kind claude --pane p1",
+            "agent start proj-one-3 --kind claude --pane p1"])
+
+    def test_a_free_name_is_not_retried_at_all(self):
+        """The loop must cost nothing in the ordinary case."""
+        self.run_layout()
+        self.assertEqual(len(self.starts()), 1)
+
+    def test_the_base_is_trimmed_so_the_suffix_fits_in_32_characters(self):
+        """Herdr names are at most 32 characters, and the picker trims the BASE
+        rather than the suffix. Trimming the suffix instead would produce a
+        33-character name that Herdr rejects, and would also let two different
+        bases collapse onto one name."""
+        self.set_workspaces({"result": {"workspaces": [
+            {"workspace_id": "w9", "active_tab_id": "t1",
+             "label": "a" * 40, "focused": True}]}})
+        base = "a" * 32
+        self.run_layout(env={"STUB_TAKEN_NAMES": base})
+        expected = "a" * 30 + "-2"
+        self.assertEqual(len(expected), 32)
+        self.assertIn("agent start %s --kind claude --pane p1" % expected,
+                      self.herdr_calls())
+
+    def test_the_success_message_names_the_agent_that_actually_started(self):
+        """Reporting the base name after falling through to a suffix would send
+        the reader to `herdr agent prompt proj-one`, which reaches somebody
+        else's agent."""
+        err = self.run_layout(env={"STUB_TAKEN_NAMES": "proj-one"})
+        self.assertIn('claude started as "proj-one-2"', err)
+        self.assertNotIn('started as "proj-one"', err)
+
+    def test_agent_not_ready_on_a_retried_name_is_still_a_success(self):
+        """The two classifications compose: the retry finds a free name, and
+        that attempt then reports the agent is waiting at a prompt."""
+        err = self.run_layout(env={
+            "STUB_TAKEN_NAMES": "proj-one",
+            "STUB_AGENT_STATUS": "1",
+            "STUB_AGENT_STDERR": error_json("agent_not_ready")})
+        self.assertIn('started as "proj-one-2" and is waiting on a prompt', err)
+
+    def test_another_error_code_during_the_retry_is_still_fatal(self):
+        """Only agent_name_taken is retried. A different failure on the second
+        attempt must stop, not spin."""
+        err = self.run_layout(
+            env={"STUB_TAKEN_NAMES": "proj-one",
+                 "STUB_AGENT_STATUS": "1",
+                 "STUB_AGENT_STDERR": error_json("agent_pane_busy")},
+            expect_status=1)
+        self.assertIn("did not start", err)
+        self.assertEqual(len(self.starts()), 2)
+
+    def test_exhausting_the_retries_is_fatal_and_says_what_it_tried(self):
+        """An unbounded retry against an error that is not really about the name
+        would spin forever, so there is a cap. Exhausting it must fail loudly:
+        a silent give-up is the failure mode this whole change removes."""
+        taken = ["proj-one"] + ["proj-one-%d" % n for n in range(2, 21)]
+        err = self.run_layout(env={"STUB_TAKEN_NAMES": " ".join(taken)},
+                              expect_status=1)
+        self.assertIn('every agent name from "proj-one" to "proj-one-20"'
+                      ' is already taken', err)
+
+    def test_the_cap_is_reached_rather_than_overshot(self):
+        """One attempt per name and no more, so the bound is exactly the cap."""
+        taken = ["proj-one"] + ["proj-one-%d" % n for n in range(2, 21)]
+        self.run_layout(env={"STUB_TAKEN_NAMES": " ".join(taken)},
+                        expect_status=1)
+        self.assertEqual(len(self.starts()), 20)
+
+    def test_herdrs_own_taken_payload_reaches_the_log(self):
+        taken = ["proj-one"] + ["proj-one-%d" % n for n in range(2, 21)]
+        err = self.run_layout(env={"STUB_TAKEN_NAMES": " ".join(taken)},
+                              expect_status=1)
+        self.assertIn('"code":"agent_name_taken"', err)
+
+    def test_a_supplied_name_that_is_taken_is_fatal_and_never_retried(self):
+        """The retry is for DERIVED names only. A caller that reserved an exact
+        string did so precisely so `herdr agent prompt <name>` reaches this
+        workspace, and silently starting the agent as something else defeats the
+        reservation more completely than refusing does."""
+        err = self.run_layout(["--agent-name", "reserved-2"],
+                              env={"STUB_TAKEN_NAMES": "reserved-2"},
+                              expect_status=1)
+        self.assertIn('the agent name "reserved-2" given with --agent-name'
+                      ' is already taken', err)
+        self.assertEqual(self.starts(),
+                         ["agent start reserved-2 --kind claude --pane p1"])
+
+    def test_a_supplied_name_is_not_silently_suffixed(self):
+        """The specific accident the rule above prevents."""
+        self.run_layout(["--agent-name", "reserved-2"],
+                        env={"STUB_TAKEN_NAMES": "reserved-2"},
+                        expect_status=1)
+        self.assertNotIn("agent start reserved-2-2 --kind claude --pane p1",
+                         self.herdr_calls())
+
 
 class Manifest(unittest.TestCase):
     """Exactly EXPECTED_EVENTS, in order, and nothing else.
@@ -824,18 +1209,16 @@ class Manifest(unittest.TestCase):
     reads pane count over the API, so two concurrent ACTING copies would both
     see one pane and both would split it. Gate 1 in bin/on-event absorbs that,
     which is what makes worktree.opened safe to subscribe as log-only
-    instrumentation.
+    instrumentation. The full reasoning is in docs/open-questions.md.
 
     Pinned to the exact list on purpose, never a membership check: the whole
     value of this test is catching a subscription nobody argued for. A
-    deliberate change to the list is a one-line edit here, with the manifest's
-    reasoning updated alongside it.
+    deliberate change to the list is a one-line edit here, with the exit
+    condition in docs/open-questions.md resolved alongside it.
     """
 
     def events(self):
         with open(MANIFEST) as f:
-            # Comments discuss the events that were measured and dropped, so
-            # match declarations only, not the prose that explains them.
             return [line.split('"')[1] for line in f
                     if line.startswith('on = "')]
 
@@ -875,7 +1258,7 @@ class Manifest(unittest.TestCase):
             readme = f.read()
         for key, default in DEFAULTS.items():
             if not default:
-                continue  # AGENT_LAYOUT_RECIPE: documented as "unset"
+                continue
             self.assertIn(default, readme, "%s default %r" % (key, default))
 
     def test_the_recipe_is_executable(self):
@@ -883,6 +1266,70 @@ class Manifest(unittest.TestCase):
         executable bit breaks both entry paths. bin/on-event and bin/config-env
         are always spawned through an interpreter and do not need one."""
         self.assertTrue(os.stat(LAYOUT).st_mode & stat.S_IXUSR)
+
+
+class NoComments(unittest.TestCase):
+    """The scripts and the manifest carry no comments, and stay that way.
+
+    This is not style policing. The rationale and the measured Herdr behaviour
+    those comments used to hold now live in docs/, and a comment creeping back
+    into a script is the first step to the two copies disagreeing. Anything
+    worth saying about this code belongs in docs/design.md,
+    docs/herdr-behaviour.md or docs/open-questions.md.
+
+    Docstrings are documentation rather than comments, so this file keeps its
+    own. It is checked here too, for its `#` lines only.
+    """
+
+    FILES = ["bin/agent-layout", "bin/on-event", "bin/config-env",
+             "herdr-plugin.toml", "tests/test_on_event.py"]
+
+    DOCS = ["docs/design.md", "docs/herdr-behaviour.md",
+            "docs/open-questions.md"]
+
+    def comment_lines(self, path):
+        """Every `#` line of `path`, excluding a line-1 shebang, as
+        (lineno, text). An indented comment counts, which is why the test is on
+        the stripped line rather than the raw one."""
+        with open(path) as f:
+            lines = f.read().splitlines()
+        return [(n, line) for n, line in enumerate(lines, 1)
+                if line.lstrip().startswith("#")
+                and not (n == 1 and line.startswith("#!"))]
+
+    def test_no_file_under_test_carries_a_comment(self):
+        for relative in self.FILES:
+            with self.subTest(path=relative):
+                found = self.comment_lines(os.path.join(ROOT, relative))
+                self.assertEqual(
+                    found, [],
+                    "%s carries %d comment line(s); move the content into "
+                    "docs/ instead" % (relative, len(found)))
+
+    def test_the_check_really_finds_a_comment(self):
+        """A canary on the test above, which would pass just as happily if
+        comment_lines() were broken. It runs the SAME method, so a broken
+        detector reddens here rather than passing everywhere.
+
+        The fixture also pins the two exemptions: a line-1 shebang is not a
+        comment, and an indented comment is."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        planted = os.path.join(tmp.name, "planted.sh")
+        with open(planted, "w") as f:
+            f.write("#!/bin/sh\ntrue\n    # an indented comment\n# a bare one\n")
+        self.assertEqual(self.comment_lines(planted),
+                         [(3, "    # an indented comment"),
+                          (4, "# a bare one")])
+
+    def test_the_documentation_that_replaced_them_exists(self):
+        """Deleting a comment is only safe because its content moved. A docs
+        file going missing must redden here rather than at the next reader."""
+        for relative in self.DOCS:
+            with self.subTest(path=relative):
+                path = os.path.join(ROOT, relative)
+                self.assertTrue(os.path.isfile(path), path)
+                self.assertGreater(os.path.getsize(path), 1000, path)
 
 
 class ManifestIsValidToml(unittest.TestCase):
