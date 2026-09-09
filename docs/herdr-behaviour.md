@@ -15,7 +15,8 @@ stale measurement with a date is still evidence, and an undated guess is not.
 Measure in an **isolated server**, never in the live one. A probe split or
 rename in the live server rearranges the workspaces you are working in.
 
-The isolation lever is `XDG_CONFIG_HOME`, paired with `--session`:
+The isolation lever **for a server you start** is `XDG_CONFIG_HOME`, paired with
+`--session`:
 
 ```sh
 rm -rf /private/tmp/hgeo && mkdir -p /private/tmp/hgeo
@@ -32,8 +33,23 @@ answering there.
 **A shell inside a Herdr pane is the dangerous case**, and it is the usual one
 when working on this plugin. Confirmed 2026-09-09: such a shell carries
 `HERDR_SOCKET_PATH`, `HERDR_PANE_ID`, `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID` and
-`HERDR_BIN_PATH` pointing at the **live** server. Scrub them, with `env -i` or
-explicit `-u`, or every "isolated" command lands in the real session.
+`HERDR_BIN_PATH` pointing at the **live** server. Scrub them, or every
+"isolated" command lands in the real session.
+
+**Scrub with an allowlist.** Start from an empty environment and add back only
+what the command needs:
+
+```sh
+env -i HOME="$HOME" PATH="$PATH" HERDR_SOCKET_PATH=<probe socket> <command>
+```
+
+Unsetting variables by name, with explicit `-u`, is the weaker fallback. It
+fails on the variable you did not think of, and the five named above are not the
+whole set. Seen 2026-09-09 in a peer session on
+`herdr-plugin-project-finder`: `HERDR_PLUGIN_CONFIG_DIR` survived a round of
+named unsets and made `bin/config-env` read another plugin's `.env`. An
+allowlist has no such failure mode, which is why it is the recommendation rather
+than one of two equal options.
 
 On **0.9.0** the probe socket is at
 `<config root>/herdr/sessions/<session>/herdr.sock`, measured 2026-09-09. The
@@ -41,7 +57,8 @@ method is unchanged; only the path is worth knowing when looking for it.
 
 Two near misses look like isolation and are not:
 
-- **`HERDR_SOCKET_PATH` moves only the socket.** A server started that way
+- **`HERDR_SOCKET_PATH` moves only the socket, so it cannot isolate a server
+  you start.** A server started that way
   restores the **live** `session.json`, runs your real workspaces in a second
   process, and writes its own state back over theirs. Measured 2026-09-08: a
   throwaway workspace created in such a server appeared in the live
@@ -49,6 +66,25 @@ Two near misses look like isolation and are not:
   minutes later, which is luck and not a safety property.
 - **`HERDR_CONFIG_PATH` isolates nothing at all.** It moves neither the socket
   nor the state, whether it names a directory or a file.
+
+**Starting a server and pointing a client at one are different problems**, and
+the first bullet is only about the first of them. Do not carry it across. For a
+**client** command, one that talks to a server something else already started,
+`HERDR_SOCKET_PATH` alone is the correct and sufficient lever. The CLI finds a
+server by socket path and by nothing else.
+
+Measured 2026-09-09: this repo's full test suite ran against the plain
+`/opt/homebrew/bin/herdr` binary, with no shim and no `--session` anywhere, and
+with only `HERDR_SOCKET_PATH` set to the isolated server's socket. Six
+workspaces were created in the isolated server. The live server held at 8
+workspaces, counted before and after.
+
+**Binary selection and server selection are separate axes.** `HERDR_BIN_PATH`
+decides which executable runs. The socket decides which server that executable
+reaches. In the run above, `HERDR_BIN_PATH` was set to the same value as the
+hardcoded default in `bin/agent-layout`, so it changed nothing, and the command
+still reached the isolated server. Testing a client command in isolation
+therefore needs no redirected binary, and no shim injecting `--session`.
 
 Keep the config root **short**, under `/private/tmp` rather than a deep scratch
 path. Startup otherwise dies with `local socket name length exceeds capacity of
