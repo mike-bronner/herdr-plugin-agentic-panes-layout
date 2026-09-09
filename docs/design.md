@@ -262,21 +262,42 @@ left, and prefixes `a` when the result does not start with a letter.
 **It truncates last, not before the prefix.** A 32-character label starting with
 a digit would otherwise come out 33 characters and be rejected.
 
-### Why this plugin does not dedupe
+### Deduping a derived name
 
-A dedupe against live agent names **is** possible: see the corrected `agent list`
-measurement in [`herdr-behaviour.md`](herdr-behaviour.md).
+A derived name can collide: two workspaces whose labels normalise to the same
+string derive the same name, and so does a run that meets an agent already live
+under it. Herdr refuses the second `agent start` with `agent_name_taken`.
 
-This file still does not do one, for a smaller reason. It lays out **one**
-workspace per run, so it has no batch of its own to collide within. A collision
-with something already live surfaces as a failing `agent start`, which is
-reported.
+So a derived name **retries**. On `agent_name_taken` the recipe tries
+`<base>-2`, then `<base>-3`, and so on, bounded at 20 attempts before it gives
+up and dies. Exhausting the bound is a real failure and is reported as one.
 
-A caller that **does** hold a batch is the whole reason `--agent-name` exists.
-The picker reserves a distinct name per workspace across one multi-select pass by
-mutating a shared set, and only it can see that set. Two of its workspaces whose
-labels normalise to the same string would otherwise derive one name twice, and
-Herdr would refuse the second `agent start` as `agent_name_taken`.
+**The base is trimmed, not the suffix.** `-17` has to fit inside the same
+32-character limit as the name it is appended to, so the base is cut to
+`32 - len(suffix)` before the suffix goes on. Trimming the suffix instead would
+produce a name that is no longer distinct, which is the one thing the retry
+exists to guarantee.
+
+**It is a loop, not a single second attempt**, and it re-reads the error each
+time round. Two concurrent processes can both read one failure and both pick
+`-2`, so the second of them must be free to fail again and move on to `-3`.
+
+A name from `--agent-name` **never** retries and dies loudly when it is taken.
+The caller reserved that exact string so `herdr agent prompt <name>` reaches the
+workspace. Quietly starting the agent under a different name would break the one
+guarantee the reservation was built for, so the collision is the caller's to
+resolve.
+
+### Why the retry lives here and not in the caller
+
+The server arbitrates `agent start` and returns `agent_name_taken` to **every**
+caller, so retrying on that error deduplicates across concurrent, unrelated
+processes.
+
+That is strictly stronger than an in-process reservation set. Such a set covers
+one run of one program, cannot see an agent started by hand, and cannot see the
+run happening in the next process along. The error can see all three, because
+the server is the only thing that knows every live name at once.
 
 ## Classifying the `agent start` result
 
@@ -289,12 +310,20 @@ stderr into the substitution and still discards the ordinary stdout. It is
 re-emitted on the fatal path, where Herdr's own wording is the useful part of the
 log entry.
 
-**Only `agent_not_ready` is reclassified as success.** Everything else stays
-fatal, `agent_pane_busy` included.
+The `case` has **three** arms, and they are the whole set:
 
-The match is against the JSON `"code":"agent_not_ready"` rather than the bare
-word. A message that merely *mentions* `agent_not_ready` is not a payload that
-*reports* it, and matching the bare word would turn a real failure green.
+| Error code | Outcome |
+| --- | --- |
+| `agent_not_ready` | **Success.** The agent did start and is waiting at a prompt. |
+| `agent_name_taken` | **Retry** under the next derived name, unless `--agent-name` supplied it. |
+| anything else | **Fatal**, `agent_pane_busy` and `timeout` included. |
+
+Fatal is the default arm rather than a list, so a code Herdr adds later is
+reported instead of being silently swallowed.
+
+Each match is against the JSON `"code":"<code>"` rather than the bare word. A
+message that merely *mentions* `agent_not_ready` is not a payload that *reports*
+it, and matching the bare word would turn a real failure green.
 
 ## `bin/on-event`: the two gates
 

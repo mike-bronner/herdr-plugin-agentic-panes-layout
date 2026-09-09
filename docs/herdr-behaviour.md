@@ -376,6 +376,5 @@ Such a detected agent holds no name and therefore cannot be collided with.
 an isolated server, `agent list` carried `probe-alpha`, `probe-beta` and
 `reserved-2` as `name` values.
 
-**A dedupe against live agent names is therefore possible.**
-`herdr-plugin-project-finder`'s `live_agent_names()` depends on it being
-possible. See [`design.md`](design.md) for why this plugin still does not dedupe.
+**A dedupe against live agent names is therefore possible.** See
+[`design.md`](design.md) for how `bin/agent-layout` retries a taken name.
