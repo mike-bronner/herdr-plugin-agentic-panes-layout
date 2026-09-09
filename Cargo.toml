@@ -1,0 +1,26 @@
+[package]
+name = "agent-layout"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.74"
+license = "MIT"
+description = "Lay out a Herdr workspace from a declarative TOML file, over Herdr's socket API"
+repository = "https://github.com/mike-bronner/herdr-plugin-agentic-panes-layout"
+
+[lib]
+name = "agent_layout"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agent-layout"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_ignored = "0.1"
+serde_json = "1"
+toml = "0.8"
+
+[profile.release]
+opt-level = "s"
+strip = true

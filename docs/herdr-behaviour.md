@@ -4,11 +4,12 @@ Herdr does not document most of what this plugin depends on. Everything below
 was measured rather than read, and this file is the record. The scripts carry no
 comments, so this is the only place these facts exist.
 
-**Every measurement here was taken against Herdr 0.8.2**, on the dates given.
-Herdr on this machine is now 0.9.0. Nothing below has been re-taken against
-0.9.0, so treat each as "true of 0.8.2" rather than "true today". Do not restate
-one as current without re-measuring, and do not delete one because it is old: a
-stale measurement with a date is still evidence, and an undated guess is not.
+**Each measurement names the Herdr version it was taken against**, and the date.
+The older entries are 0.8.2; the socket-API section and a few marked entries were
+taken against 0.9.0. Treat each as "true of that version" rather than "true
+today". Do not restate one as current without re-measuring, and do not delete one
+because it is old: a stale measurement with a date is still evidence, and an
+undated guess is not.
 
 ## How to measure safely
 
@@ -47,7 +48,7 @@ Unsetting variables by name, with explicit `-u`, is the weaker fallback. It
 fails on the variable you did not think of, and the five named above are not the
 whole set. Seen 2026-09-09 in a peer session on
 `herdr-plugin-project-finder`: `HERDR_PLUGIN_CONFIG_DIR` survived a round of
-named unsets and made `bin/config-env` read another plugin's `.env`. An
+named unsets and made a settings reader load another plugin's config. An
 allowlist has no such failure mode, which is why it is the recommendation rather
 than one of two equal options.
 
@@ -115,9 +116,10 @@ PATH=/usr/bin:/bin:/usr/sbin:/sbin
 
 Verified against the live process, 2026-09-05. `/opt/homebrew` is **not** on it,
 so a bare `herdr` does not resolve from anything the server spawns. This is the
-trap that killed four third-party plugins. It is why this plugin spells
-`/bin/sh` and `/usr/bin/python3` by absolute path, and why it resolves the herdr
-binary from `HERDR_BIN_PATH`.
+trap that killed four third-party plugins. It is why this plugin spells `/bin/sh`
+and `/usr/bin/git` by absolute path, why `bin/agent-layout` searches absolute
+`cargo` locations rather than trusting `PATH`, and why it resolves the herdr
+binary from `HERDR_BIN_PATH` for its own toasts.
 
 ### What a `[[keys.command]]` process is handed
 
@@ -133,9 +135,10 @@ HERDR_BIN_PATH             HERDR_SOCKET_PATH  HERDR_SESSION
 
 `HERDR_PANE_ID` is **not** among them. That variable belongs to the environment
 Herdr injects into a managed pane, which is a different set entirely.
-`HERDR_PLUGIN_CONFIG_DIR` is not among them either, which is why
-`bin/config-env` has to ask `herdr plugin config-dir` when it is reached from a
-keybinding.
+`HERDR_PLUGIN_CONFIG_DIR` is not among them either, which is why the config root
+cannot be derived from that variable alone and falls back to `XDG_CONFIG_HOME` and
+then the documented default. `HERDR_SOCKET_PATH` **is** among them, which is what
+makes the socket transport work from a keybinding as readily as from a hook.
 
 ### What a plugin event hook is handed
 
@@ -261,21 +264,42 @@ left it on `w3:p5`.
 new pane's id, which is not derivable from the pane that was split. Documented on
 0.8.2 as `.result.pane`, **measured** as `.result.pane.pane_id`.
 
-## `pane run`
+## `pane run` is CLI sugar, not an API method
 
-`pane run <pane> <command>` takes the command as **one argument**, not a
-word-split list, which is how Herdr's own docs use it
-(`herdr pane run <id> "just test"`). It types the text into the pane's shell and
-presses Enter, so the shell does the parsing and a command with flags works
-unquoted.
+**`pane.run` does not exist in the socket API**, at protocol 20 (Herdr 0.8.2) or
+protocol 22 (0.9.0). Confirmed 2026-09-09 two ways: it is absent from the 102
+request variants in `herdr api schema --json`, and sending it returns
+`invalid_request` with a message that lists every method which does exist.
+
+`herdr pane run <pane> <command>` is **client-side sugar**. Herdr's own skill
+documentation describes it as atomically sending command text and Enter. The
+equivalent request is:
+
+```json
+{"id":"x","method":"pane.send_input",
+ "params":{"pane_id":"w1:p2","text":"lazygit","keys":["enter"]}}
+```
+
+Measured 2026-09-09 in an isolated server: that request answered
+`{"type":"ok"}`, and `pane.read` afterwards showed the command echoed at the
+prompt **and** its output. Sending `text` without `keys` leaves the line sitting
+unexecuted at the prompt, which looks identical in a screenshot.
+
+`pane.read` needs a `source`, which is required and not shown in `--help`. The
+accepted values are `visible`, `recent`, `recent_unwrapped` and `detection`;
+`screen` is not one of them.
+
+The CLI takes the command as **one argument**, not a word-split list, which is how
+Herdr's own docs use it (`herdr pane run <id> "just test"`). Either way the pane's
+shell does the parsing, so a command with flags works unquoted.
 
 A pane's shell is **interactive** and sources the user's rc files, so it has the
 user's own `PATH` rather than the launchd one. Measured 2026-09-08:
-`command -v lazygit` run through `pane run` answered `/opt/homebrew/bin/lazygit`.
-That is why a bare `lazygit` is a workable default even though the launchd PATH
-rule applies everywhere else.
+`command -v lazygit` answered `/opt/homebrew/bin/lazygit`. That is why a bare
+`lazygit` is a workable default even though the launchd PATH rule applies
+everywhere else.
 
-`pane run` was measured to work immediately after a split, with no settling
+Running a command was measured to work immediately after a split, with no settling
 delay needed. This is unlike `agent start`, which has a real race.
 
 ## `pane rename` and `agent start` write independent fields
@@ -377,4 +401,99 @@ an isolated server, `agent list` carried `probe-alpha`, `probe-beta` and
 `reserved-2` as `name` values.
 
 **A dedupe against live agent names is therefore possible.** See
-[`design.md`](design.md) for how `bin/agent-layout` retries a taken name.
+[`design.md`](design.md) for how a taken name is retried.
+
+## The socket API
+
+Everything in this section was measured on **0.9.0**, 2026-09-09, against an
+isolated `herdr --session apiprobe server` driven by raw socket writes rather than
+by the CLI.
+
+### The wire protocol
+
+Newline-delimited JSON, **no handshake**. One JSON line out, one JSON line back,
+one connection per request. The socket path arrives as `HERDR_SOCKET_PATH`, which
+Herdr injects into plugin processes and into keybinding commands alike.
+
+```
+-> {"id":"probe","method":"ping","params":{}}
+<- {"id":"probe","result":{"type":"pong","version":"0.9.0","protocol":22,
+                           "capabilities":{...}}}
+```
+
+A response is `{id, result}` or `{id, error}`. An error body is
+`{"code": "...", "message": "..."}` — a **structured code**, which is why nothing
+in this plugin pattern-matches error text.
+
+Note that `id` is echoed on success but comes back as `""` on a request that
+failed to deserialise at all, so it cannot be used to correlate a parse failure.
+
+### Versions
+
+| Version | Protocol | Request variants |
+| --- | --- | --- |
+| 0.8.2 | 20 | 91 |
+| 0.9.0 | 22 | 102 |
+
+`schema_version` is 1 in both. There is **no version negotiation**, but `ping`
+returns `{version, protocol, capabilities}`, which is the clean way to discover
+what a server supports rather than assuming. The full protocol is described by
+`docs/next/api/herdr-api.schema.json` inside the crate, 269 KB, and is dumped by
+`herdr api schema --json`.
+
+Every method this plugin sends exists at **protocol 20**: `workspace.list`,
+`pane.list`, `tab.list`, `tab.create`, `tab.rename`, `pane.split`, `pane.rename`,
+`pane.send_input`, `agent.start`, `notification.show`.
+
+### `SplitDirection` is exactly two values
+
+```json
+{"enum": ["right", "down"], "type": "string"}
+```
+
+Read from the schema at protocol 22. There are no `vertical`/`horizontal` aliases.
+
+### `pane.split` and `tab.create` both answer with the pane they made
+
+`pane.split` answers `result.pane.pane_id`. `tab.create` answers
+`result.tab.tab_id` **and** `result.root_pane.pane_id`, so a newly created tab's
+pane needs no follow-up `pane.list`.
+
+`ratio` is nullable. Omitting it lets Herdr choose rather than forcing a value.
+
+**Send `ratio` as a JSON double, not a float32.** The schema says
+`"format": "float"`, but serialising an `f32` 0.6 through JSON widens it to
+`0.6000000238418579` on the wire. Herdr parses that back to 0.6 so it works, but
+the value no longer matches what the user wrote in their config. Caught by a test
+asserting the exact request.
+
+### `tab.create` exists at 0.8.2
+
+`herdr tab create` was confirmed at tag v0.8.2 with identical flags by reading
+`src/cli/tab.rs`. This was the open question behind the version floor.
+
+### An unlabelled tab's label is its own number
+
+A tab created without a `label` reports `"label": "1"`, not an empty string or
+null. So a tab-name guard comparing a layout's tab name against existing labels
+cannot collide with an unnamed tab by accident.
+
+### `pane.list` carries `agent` only once one is really attached
+
+A pane running an agent reports `"agent": "claude"`. Measured on the **live**
+server, 2026-09-09, read-only.
+
+The absence of the key does not always mean no agent: immediately after
+`agent.start` the answer carried `"launch_pending": true` and the pane still
+reported no `agent` and `agent_status: "unknown"`. The guard reading `agent` is
+therefore a check on a **settled** agent, which is what v0.2.0 also did.
+
+### `notification.show` can succeed and show nothing
+
+```json
+{"type":"notification_show","shown":false,"reason":"disabled"}
+```
+
+A `result` rather than an `error`, so a toast that the user has turned off is not
+a failure. Nothing in this plugin inspects `shown`, deliberately: the toast is
+best-effort and stderr carries the same message.

@@ -1,8 +1,11 @@
 # Agentic Panes Layout — a Herdr plugin
 
-Lays out every new git worktree workspace in [Herdr](https://herdr.dev), the
-agent-aware terminal multiplexer, the moment it is created: the tab renamed
-`agent`, and three labelled panes.
+Lays out a [Herdr](https://herdr.dev) workspace from a **declarative TOML file**:
+tabs, panes, splits, commands, agents, and optional pane labels. Applied
+automatically the moment a git worktree workspace is created, or on a keypress
+for any workspace you are looking at.
+
+With no config file, the built-in layout is this:
 
 ```
 +-----------------+----------+
@@ -13,7 +16,8 @@ agent-aware terminal multiplexer, the moment it is created: the tab renamed
 +-----------------+----------+
 ```
 
-Every pane carries a label, and every proportion and command is a setting.
+Everything above is configurable, including the number of tabs and the number of
+panes. **Pane labels are opt-in**: nothing is renamed unless you ask for it.
 
 ## Install
 
@@ -29,44 +33,88 @@ git clone git@github.com:mike-bronner/herdr-plugin-agentic-panes-layout.git
 herdr plugin link /absolute/path/to/herdr-plugin-agentic-panes-layout
 ```
 
-Requires Herdr 0.8.2 or newer. No other dependencies: `/bin/sh` and
-`/usr/bin/python3` are both spelled by absolute path, because Herdr's server
-runs under launchd with `PATH=/usr/bin:/bin:/usr/sbin:/sbin` and `/opt/homebrew`
-is not on it.
+Requires Herdr 0.8.2 or newer. Every socket method the plugin uses exists at
+protocol 20, which is 0.8.2.
+
+### It builds itself on first use
+
+The plugin is a Rust binary. `bin/agent-layout` is a small `sh` shim that builds
+it the first time it is needed and then execs it, and **rebuilds whenever the
+sources are newer than the binary**.
+
+That last part is the point. Herdr does have a `[[build]]` manifest entry that
+runs once at link time, and this plugin deliberately does not use it: a plugin
+linked from a working copy you are still editing would keep running a stale
+binary until you remembered to relink. See
+[`docs/design.md`](docs/design.md) for the trade-off.
+
+**Build it once yourself to avoid a slow first event:**
+
+```sh
+cd /path/to/herdr-plugin-agentic-panes-layout
+cargo build --release
+```
+
+You need a Rust toolchain (1.74 or newer) to install from source; you do not need
+one afterwards. The shim does **not** assume `cargo` is on `PATH`, because Herdr's
+server runs under launchd with `PATH=/usr/bin:/bin:/usr/sbin:/sbin`. It searches
+`CARGO`, `$CARGO_HOME/bin`, `~/.cargo/bin`, and the Homebrew rustup prefixes. If
+it cannot find cargo and cannot find a built binary, it says so rather than going
+quiet.
 
 ## What it does
 
-`bin/on-event` is a `worktree.created` hook. It answers two questions and
-nothing else:
+`bin/on-event` is a `worktree.created` hook. It checks that the event is the one
+that means a worktree was made — `worktree.opened` is subscribed as well, but only
+so Herdr logs it while a design question is settled, in
+[`docs/open-questions.md`](docs/open-questions.md) — and hands off to the layout
+binary with `--from-event`.
 
-1. Is this the event that means a worktree was made? Only `worktree.created` is
-   acted on. `worktree.opened` is subscribed as well, but only so that Herdr
-   logs it while a design question is settled. That question, and the condition
-   that resolves it, are in [`docs/open-questions.md`](docs/open-questions.md).
-2. Is the new workspace the focused one? `herdr worktree create --no-focus`
-   emits `worktree.created` with `"focused": false`, and laying out an unfocused
-   workspace would start an agent in whatever you were looking at instead.
+The binary then refuses to act unless the new workspace is the **focused** one.
+`herdr worktree create --no-focus` emits `worktree.created` with
+`"focused": false`, and laying out an unfocused workspace would start an agent in
+whatever you were looking at instead.
 
-If both answers are yes it hands off to `bin/agent-layout` with no arguments,
-which applies the recipe to the focused workspace: rename the tab, split the
-single pane in two, split the new pane again, run lazygit in the upper one,
-label all three, and start the agent in the original pane.
+It then reads [`agent-layout.toml`](docs/configuration.md), picks a layout for the
+project, and applies it: rename or create each tab, split each pane out of the one
+before it, run each pane's command, label the panes that asked to be labelled, and
+start each pane's agent.
 
-`bin/agent-layout` is safe to run again. It refuses to touch a tab that already
-has more than one pane, or whose pane already hosts an agent, so a second run is
-a no-op rather than a second layout.
+### It speaks Herdr's socket API, not the CLI
 
-Only the tab rename is fatal on failure, because it happens before any pane is
-created and leaves the workspace clean for a retry. Once the panes exist, a
-failed lazygit or a failed label is reported as a toast and the run still
-succeeds: the guard above means no later run could finish the job, so reporting
-a built layout as a failure would help nobody.
+Requests go straight down `HERDR_SOCKET_PATH` as newline-delimited JSON, one
+connection per request. No `herdr` subprocesses. Errors come back as a structured
+code rather than as text to be pattern-matched out of stderr.
+
+### It is safe to run again
+
+The re-run guard is **tab-name based**: a tab whose name already exists in the
+workspace is skipped rather than rebuilt. So a second run is a no-op, and a run
+that died halfway is finished by the next one.
+
+The first tab is the exception, because it is not created — it takes over the
+workspace's existing tab by being renamed. So it is skipped when a tab of its name
+exists, it takes over the active tab when that tab holds a single pane and no
+agent, and when the active tab is busy it is created as a new tab instead of being
+wrecked.
+
+### What is fatal and what is not
+
+Opening a tab is fatal on failure, because it happens before any pane of that tab
+exists and leaves things clean for a retry. Splits are fatal, because the next
+step needs the pane id the split returns. Once the panes exist, a failed command
+or a failed label is reported and the run still succeeds: the guard means no later
+run could finish the job, so reporting a built layout as a failure would help
+nobody.
+
+**A bad config file is never fatal.** It falls back to the built-in layout and
+says so. See the failure table in [`docs/configuration.md`](docs/configuration.md).
 
 ## Keybinding
 
 `bin/agent-layout` can also be run on its own, against whichever workspace is
-focused. That is useful for a plain repo or a worktree you opened by hand.
-Bind it in `~/.config/herdr/config.toml`:
+focused. That is useful for a plain repo or a worktree you opened by hand. Bind it
+in `~/.config/herdr/config.toml`:
 
 ```toml
 [[keys.command]]
@@ -79,179 +127,156 @@ The absolute path is required. A `[[keys.command]]` process is handed
 `HERDR_ACTIVE_*`, `HERDR_BIN_PATH`, `HERDR_SOCKET_PATH` and `HERDR_SESSION`, and
 no `HERDR_PLUGIN_ROOT` to resolve a relative path against.
 
+## Configure
+
+Settings live in **one TOML file in Herdr's config root**, beside Herdr's own
+`config.toml`:
+
+```
+~/.config/herdr/agent-layout.toml
+```
+
+The file is optional. Here is the built-in layout written out, ready to edit:
+
+```toml
+default = "three-pane"
+
+[[layouts.three-pane.tabs]]
+name = "agent"
+
+[[layouts.three-pane.tabs.panes]]
+agent = "claude"
+
+[[layouts.three-pane.tabs.panes]]
+split = "right"
+ratio = 0.5
+command = "lazygit"
+
+[[layouts.three-pane.tabs.panes]]
+split = "down"
+ratio = 0.6
+```
+
+Add a `label` to any pane to have it renamed. Omit the key and no rename happens.
+
+Point a project at a different layout with a `[[projects]]` rule:
+
+```toml
+default = "three-pane"
+
+[[projects]]
+path = "/Users/you/Developer/some-repo"
+layout = "solo"
+
+[[layouts.solo.tabs]]
+name = "agent"
+
+[[layouts.solo.tabs.panes]]
+agent = "claude"
+```
+
+`path` is matched against both the workspace's checkout path and its repo root, so
+naming a repository covers every worktree of it. Rules are evaluated in file
+order and the first match wins.
+
+**The full reference is [`docs/configuration.md`](docs/configuration.md):** the
+whole schema, how the config root is derived, what each failure does, and why the
+file sits where it does. The config root is never hardcoded, because
+`XDG_CONFIG_HOME` relocates it and a debug build of Herdr renames it.
+
+### Upgrading from 0.2.x
+
+The `.env` in the plugin config directory is **gone, with no fallback**, and so
+are all eleven `AGENT_LAYOUT_*` variables and the `AGENT_LAYOUT_RECIPE` escape
+hatch. Move your settings into `agent-layout.toml`; the table in
+[`docs/configuration.md`](docs/configuration.md) says what replaced what.
+
+If you relied on the three pane labels, add `label` keys to the block above. They
+are no longer applied by default, which was the point of the release.
+
 ## Arguments
 
-With **no arguments**, `bin/agent-layout` does exactly what the two sections
-above describe: the focused workspace, an agent name derived from that
-workspace's label, and an agent started. The event hook execs it that way and the
-keybinding presses it that way, so that behaviour is fixed.
-
-Two optional flags exist for a third caller, another program running this file
-as an executable:
+With **no arguments**, the binary lays out the focused workspace with an agent
+name derived from that workspace's label. The keybinding presses it that way, so
+that behaviour is fixed.
 
 ```sh
-bin/agent-layout [--workspace <id>] [--agent-name <name>]
+bin/agent-layout [--from-event] [--workspace <id>] [--agent-name <name>]
 ```
+
+`--from-event` reads `HERDR_PLUGIN_EVENT_JSON` and does nothing unless its
+workspace is the focused one. The event hook passes it and nothing else does.
 
 `--workspace <id>` lays out the workspace with that id rather than the focused
 one. "Which workspace is focused?" is the right question for the hook and the
-keybinding, which both mean the workspace you are looking at, and the wrong one
-for a caller that opens several workspaces unfocused and picks a focus target at
-the end. Nothing else changes: the tab, the label and the working directory are
-all read off the workspace named here.
+keybinding, and the wrong one for a caller that opens several workspaces unfocused
+and picks a focus target at the end.
 
-`--agent-name <name>` starts the agent under that exact name, instead of one
-derived from the workspace label. The name reaches Herdr **verbatim**, so it is
-not lowercased, not prefixed and not truncated. A caller that reserves distinct
-names across a batch of workspaces does so precisely so that
-`herdr agent prompt <name>` reaches each one, and re-deriving the string here
-would break the guarantee the reservation was made for. An invalid name is
-Herdr's to reject, and the refusal is reported as a toast.
+`--agent-name <name>` starts the agent under that exact name instead of a derived
+one. The name reaches Herdr **verbatim**: not lowercased, not prefixed, not
+truncated. A caller that reserves distinct names across a batch of workspaces does
+so precisely so `herdr agent prompt <name>` reaches each one. With several
+agent-bearing panes it binds to the first, and the rest derive.
 
-There is no flag to skip the agent. The first pane always holds the preferred
-agent, and `agent start` blocks for up to 30 seconds. A caller that must not
-wait that long detaches the whole `bin/agent-layout` call. Detaching is what
-buys that, on its own and with either flag or neither. `--agent-name` is a
-separate matter: it is for a caller that already reserved a name and needs Herdr
-to honour that exact string.
+There is no flag to skip the agent, and none to point at an external script.
 
-These are per-call arguments and deliberately **not** settings, so neither has an
-`AGENT_LAYOUT_` equivalent. Those settings are one shared vocabulary, so a value
-means the same thing wherever it is read. A per-call argument hiding among them
-would let a stray `export` in an interactive shell silently retarget a keybinding
-press.
-
-Every argument error is fatal, and is reported before anything is read or
-changed: an unknown flag, a flag missing its value, a flag given an empty value,
+Every argument error is fatal and is reported **before anything is read or
+changed**: an unknown flag, a flag missing its value, a flag given an empty value,
 and the same flag given twice. A `--workspace` id that matches no workspace is
 fatal too, rather than falling back to the focused one. That fallback would lay
 out whatever you happened to be looking at, which is the accident the flag exists
 to prevent.
 
-The "already laid out?" guard applies either way. It reads the pane count of the
-workspace being laid out, so a second run against the same target is a no-op
-whichever way it was reached.
-
-## Configure
-
-Settings live in a `.env` file in the plugin config directory:
-
-```sh
-herdr plugin config-dir mikebronner.agentic-panes-layout
-# /Users/you/.config/herdr/plugins/config/mikebronner.agentic-panes-layout
-```
-
-```ini
-# agent to start, any kind `herdr agent start --kind` accepts (default: claude)
-AGENT_LAYOUT_KIND=claude
-
-# where the lazygit/shell column goes: right or down (default: right)
-AGENT_LAYOUT_DIRECTION=right
-
-# the share of the tab the AGENT keeps (default: 0.5)
-AGENT_LAYOUT_RATIO=0.5
-
-# what the tab is renamed to (default: agent)
-AGENT_LAYOUT_TAB_NAME=agent
-
-# command run in the tool pane (default: lazygit)
-AGENT_LAYOUT_TOOL_COMMAND=lazygit
-
-# where the bare shell goes, relative to the tool pane (default: down)
-AGENT_LAYOUT_TOOL_DIRECTION=down
-
-# the share of that column the TOOL pane keeps (default: 0.6)
-AGENT_LAYOUT_TOOL_RATIO=0.6
-
-# pane labels (defaults: agent, lazygit, shell)
-AGENT_LAYOUT_AGENT_LABEL=agent
-AGENT_LAYOUT_TOOL_LABEL=lazygit
-AGENT_LAYOUT_SHELL_LABEL=shell
-
-# run this script instead of the bundled recipe (default: unset)
-AGENT_LAYOUT_RECIPE=
-```
-
-Both ratios name the share kept by the pane **being split**, so a bigger number
-always means a bigger agent or a bigger tool pane. Herdr does not document this,
-and the 0.5 default cannot show it, so it was measured: `split right --ratio 0.7`
-leaves the original pane 66 of 94 columns, and the new pane gets `1 - ratio`.
-
-`AGENT_LAYOUT_TOOL_COMMAND` is one command line, sent to the tool pane's own
-shell, so flags work without quoting. It is the one setting whose default is a
-bare name rather than an absolute path. The absolute-path rule above applies to
-what Herdr's launchd server spawns. A pane's shell is interactive and has the
-user's own `PATH`, which was measured to resolve `lazygit` to
-`/opt/homebrew/bin/lazygit`. A bare name is also the only default that can work
-on both declared platforms.
-
-Every key is optional, and every default is the layout described at the top of
-this file. Real environment variables win over the file, a comment needs a line
-of its own, and a line the plugin cannot parse is skipped rather than failing
-the hook.
-
-Values are not validated here. Herdr's own CLI rejects an unknown agent kind, an
-unknown direction and a non-numeric ratio with a named error, which the plugin
-reports as a toast and records in
-`herdr plugin log list --plugin mikebronner.agentic-panes-layout`.
-
-`AGENT_LAYOUT_RECIPE` replaces the layout entirely: point it at your own
-executable and `bin/on-event` runs that once the two gates pass. A path that is
-not executable is an error, not a silent fall back to the bundled recipe.
-
 ## Known limitation
 
-`agent start` sometimes fails with `agent_pane_busy` ("is not an available
+`agent.start` sometimes fails with `agent_pane_busy` ("is not an available
 shell"). The hook fires within about two milliseconds of the workspace being
-created, and the new pane's shell has not always reached its interactive prompt
-by then.
+created, and the new pane's shell has not always reached its interactive prompt by
+then.
 
-Herdr 0.8.2 has no probe for that specific state. There is no `pane wait-shell`,
-and a pane reports no `available` field. The closest thing, `pane wait-output`,
-waits for text you name, which means guessing the user's shell prompt. So the
-plugin neither retries nor sleeps: the right wait is unmeasured, and a made-up
-one would only trade a visible failure for an invisible delay. The failure is
-reported as a toast, and pressing the keybinding afterwards finishes the layout.
+Herdr has no probe for that specific state. There is no `pane wait-shell`, and a
+pane reports no `available` field. The closest thing, `pane.wait_for_output`, waits
+for text you name, which means guessing your shell prompt. So the plugin neither
+retries nor sleeps: the right wait is unmeasured, and a made-up one would only
+trade a visible failure for an invisible delay. The failure is reported as a toast,
+and pressing the keybinding afterwards finishes the layout.
 
-`agent_not_ready` is a different outcome and is treated as success. Herdr
-documents it as "the agent is blocked during startup", which means the agent did
-start and is waiting at a question. On a fresh worktree that question is Claude
-Code's trust-this-folder prompt.
+`agent_not_ready` is a different outcome and is treated as success. Herdr documents
+it as "the agent is blocked during startup", which means the agent did start and is
+waiting at a question. On a fresh worktree that question is Claude Code's
+trust-this-folder prompt.
 
 ## Tests
 
 ```sh
-python3 -m unittest discover tests
+cargo test
 ```
 
-The scripts are run for real as subprocesses, against a stub `herdr` binary and
-a stub recipe planted in a temporary directory. Nothing is imported and no pane
-is ever split.
-
-One check needs a newer interpreter than the plugin does. The suite parses
-`herdr-plugin.toml` for real, because Herdr re-reads that file at dispatch time
-and a syntax error in it stops the plugin silently. Parsing needs `tomllib`,
-which arrived in Python 3.11, and `/usr/bin/python3` is 3.9. Under 3.9 that one
-check is skipped and the run prints a banner saying so, because a green suite
-there is not a checked manifest. Run the suite under a 3.11 or newer
-interpreter to include it.
+The binary is run for real as a subprocess against a **stub socket server** in a
+temporary directory. Nothing is mocked in-process and no pane is ever split. Unit
+tests sit beside the code for the parts a socket cannot reach: the config schema,
+project matching, and agent-name derivation.
 
 ## Documentation
 
-The scripts and the manifest carry no comments. Everything that would have been
-one lives in `docs/`:
+The shim, the hook and the manifest carry no comments. Everything that would have
+been one lives in `docs/`:
 
-- [`docs/design.md`](docs/design.md) — why the code in `bin/` is shaped as it is.
-  The entry paths, the arguments, the guard, the fatal versus non-fatal split,
-  and the settings contract.
+- [`docs/configuration.md`](docs/configuration.md) — `agent-layout.toml` in full:
+  the schema, the config root, per-project rules, and what every kind of bad file
+  does.
+- [`docs/design.md`](docs/design.md) — why the code is shaped as it is. The
+  entry paths, the arguments, the guard, the fatal versus non-fatal split, the
+  socket transport, and the trust boundary.
 - [`docs/herdr-behaviour.md`](docs/herdr-behaviour.md) — Herdr behaviour this
-  plugin depends on that Herdr does not document, such as which side `--ratio`
-  sizes. Every entry is dated and attributed. **Read the measurement method
-  there before probing anything**: measure in an isolated server, never in the
-  live one, or a probe split will rearrange the workspaces you are working in.
+  plugin depends on that Herdr does not document, such as which side `ratio`
+  sizes and the fact that `pane.run` is not an API method. Every entry is dated
+  and attributed. **Read the measurement method there before probing anything**:
+  measure in an isolated server, never the live one, or a probe split will
+  rearrange the workspaces you are working in.
 - [`docs/open-questions.md`](docs/open-questions.md) — decisions deliberately not
   taken yet, each with the condition that resolves it. The `worktree.opened`
   subscription is the open one.
 
-Every measurement recorded there was taken against Herdr 0.8.2. Treat each as
-"true of 0.8.2" rather than "true today".
+Measurements there are dated and attributed to a Herdr version. Treat each as
+"true of that version" rather than "true today".

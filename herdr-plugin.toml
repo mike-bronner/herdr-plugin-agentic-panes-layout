@@ -1,8 +1,8 @@
 id = "mikebronner.agentic-panes-layout"
 name = "Agentic Panes Layout"
-version = "0.2.0"
+version = "0.3.0"
 min_herdr_version = "0.8.2"
-description = "Lay out a newly created worktree workspace: agent, lazygit and a shell in three labelled panes"
+description = "Lay out a workspace from a declarative TOML file: tabs, panes, commands, agents"
 platforms = ["macos", "linux"]
 
 [[events]]

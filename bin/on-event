@@ -3,27 +3,6 @@ set -eu
 
 [ "${HERDR_PLUGIN_EVENT:-}" = "worktree.created" ] || exit 0
 
-/usr/bin/python3 -c '
-import json, os, sys
-ws = json.loads(os.environ["HERDR_PLUGIN_EVENT_JSON"])["data"]["workspace"]
-sys.exit(0 if ws.get("focused") else 1)
-' || exit 0
-
 PLUGIN_ROOT="${HERDR_PLUGIN_ROOT:-$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)}"
 
-settings="$(/usr/bin/python3 "$PLUGIN_ROOT/bin/config-env")" || {
-    printf 'agent-layout: cannot read the plugin settings from %s\n' "$PLUGIN_ROOT" >&2
-    exit 1
-}
-eval "$settings"
-
-RECIPE="$PLUGIN_ROOT/bin/agent-layout"
-if [ -n "$AGENT_LAYOUT_RECIPE" ]; then
-    RECIPE="$AGENT_LAYOUT_RECIPE"
-    [ -x "$RECIPE" ] || {
-        printf 'agent-layout: AGENT_LAYOUT_RECIPE is not executable: %s\n' "$RECIPE" >&2
-        exit 1
-    }
-fi
-
-exec "$RECIPE"
+exec "$PLUGIN_ROOT/bin/agent-layout" --from-event

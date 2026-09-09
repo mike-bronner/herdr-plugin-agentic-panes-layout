@@ -1,155 +1,57 @@
 #!/bin/sh
 set -eu
 
-HERDR="${HERDR_BIN_PATH:-/opt/homebrew/bin/herdr}"
-PY=/usr/bin/python3
+PLUGIN_ROOT="${HERDR_PLUGIN_ROOT:-$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)}"
+BIN="$PLUGIN_ROOT/target/release/agent-layout"
 
 say() {
     printf 'agent-layout: %s\n' "$*" >&2
-    "$HERDR" notification show "agent layout" --body "$*" >/dev/null 2>&1 || true
+    if [ -n "${HERDR_BIN_PATH:-}" ] && [ -x "${HERDR_BIN_PATH:-}" ]; then
+        "$HERDR_BIN_PATH" notification show "agent layout" --body "$*" >/dev/null 2>&1 || true
+    fi
 }
 die() { say "$*"; exit 1; }
 
-[ -x "$HERDR" ] || die "no herdr binary at $HERDR"
-[ -x "$PY" ] || die "no python3 at $PY"
-
-WS_ARG=""
-NAME_ARG=""
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        --workspace)
-            [ -z "$WS_ARG" ] || die "--workspace given more than once"
-            [ "$#" -ge 2 ] && [ -n "$2" ] || die "--workspace needs a workspace id"
-            WS_ARG="$2"
-            shift 2
-            ;;
-        --agent-name)
-            [ -z "$NAME_ARG" ] || die "--agent-name given more than once"
-            [ "$#" -ge 2 ] && [ -n "$2" ] || die "--agent-name needs an agent name"
-            NAME_ARG="$2"
-            shift 2
-            ;;
-        *)
-            die "unknown argument: $1"
-            ;;
-    esac
-done
-
-PLUGIN_ROOT="${HERDR_PLUGIN_ROOT:-$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)}"
-settings="$("$PY" "$PLUGIN_ROOT/bin/config-env")" \
-    || die "cannot read the plugin settings from $PLUGIN_ROOT"
-eval "$settings"
-
-if [ -n "$WS_ARG" ]; then
-    no_target="no workspace \"$WS_ARG\" in the Herdr server"
-else
-    no_target="cannot read a focused workspace from the Herdr server"
-fi
-
-export WS_ARG
-info="$("$HERDR" workspace list 2>/dev/null | "$PY" -c '
-import json, os, shlex, sys
-ws = json.load(sys.stdin)["result"]["workspaces"]
-want = os.environ["WS_ARG"]
-if want:
-    w = next((x for x in ws if x.get("workspace_id") == want), None)
-else:
-    w = next((x for x in ws if x.get("focused")), None)
-if not w:
-    sys.exit(1)
-print("WS=" + shlex.quote(w["workspace_id"]))
-print("TAB=" + shlex.quote(w["active_tab_id"]))
-print("LABEL=" + shlex.quote(w.get("label") or w["workspace_id"]))
-' 2>/dev/null)" || die "$no_target"
-eval "$info"
-
-export TAB
-info="$("$HERDR" pane list --workspace "$WS" 2>/dev/null | "$PY" -c '
-import json, os, shlex, sys
-panes = [p for p in json.load(sys.stdin)["result"]["panes"]
-         if p.get("tab_id") == os.environ["TAB"]]
-print("COUNT=%d" % len(panes))
-if len(panes) == 1:
-    print("PANE=" + shlex.quote(panes[0]["pane_id"]))
-    print("CWD=" + shlex.quote(panes[0].get("cwd") or ""))
-    print("AGENT=" + shlex.quote(panes[0].get("agent") or ""))
-' 2>/dev/null)" || die "cannot list the panes of $LABEL"
-eval "$info"
-
-[ "$COUNT" = 1 ] || { say "$LABEL: active tab has $COUNT panes, not 1 — left alone"; exit 0; }
-[ -z "$AGENT" ] || { say "$LABEL: pane already runs $AGENT — left alone"; exit 0; }
-[ -n "$CWD" ] || die "$LABEL: pane reports no working directory"
-
-"$HERDR" tab rename "$TAB" "$AGENT_LAYOUT_TAB_NAME" >/dev/null \
-    || die "$LABEL: could not rename the tab to \"$AGENT_LAYOUT_TAB_NAME\""
-
-split_pane() {
-    "$HERDR" pane split --pane "$1" --direction "$2" --ratio "$3" \
-        --cwd "$CWD" --no-focus 2>/dev/null | "$PY" -c '
-import json, sys
-sys.stdout.write(json.load(sys.stdin)["result"]["pane"]["pane_id"])
-' 2>/dev/null
-}
-
-TOOL_PANE="$(split_pane "$PANE" "$AGENT_LAYOUT_DIRECTION" "$AGENT_LAYOUT_RATIO")" \
-    || die "$LABEL: could not split the pane ($AGENT_LAYOUT_DIRECTION, ratio $AGENT_LAYOUT_RATIO)"
-
-SHELL_PANE="$(split_pane "$TOOL_PANE" "$AGENT_LAYOUT_TOOL_DIRECTION" "$AGENT_LAYOUT_TOOL_RATIO")" \
-    || die "$LABEL: could not split the tool pane ($AGENT_LAYOUT_TOOL_DIRECTION, ratio $AGENT_LAYOUT_TOOL_RATIO)"
-
-"$HERDR" pane run "$TOOL_PANE" "$AGENT_LAYOUT_TOOL_COMMAND" >/dev/null 2>&1 \
-    || say "$LABEL: panes are laid out, but \"$AGENT_LAYOUT_TOOL_COMMAND\" would not run"
-
-label_pane() {
-    "$HERDR" pane rename "$1" "$2" >/dev/null 2>&1 \
-        || say "$LABEL: could not label pane $1 \"$2\""
-}
-label_pane "$PANE" "$AGENT_LAYOUT_AGENT_LABEL"
-label_pane "$TOOL_PANE" "$AGENT_LAYOUT_TOOL_LABEL"
-label_pane "$SHELL_PANE" "$AGENT_LAYOUT_SHELL_LABEL"
-
-if [ -n "$NAME_ARG" ]; then
-    NAME="$NAME_ARG"
-else
-    NAME="$(printf '%s' "$LABEL" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9_-' '-' \
-            | sed 's/^-*//; s/-*$//')"
-    [ -n "$NAME" ] || NAME=agent
-    case "$NAME" in [a-z]*) ;; *) NAME="a${NAME}" ;; esac
-    NAME="$(printf '%s' "$NAME" | cut -c1-32)"
-fi
-
-NAME_BASE="$NAME"
-NAME_MAX_TRIES=20
-try=1
-
-while :; do
-    if start_err="$("$HERDR" agent start "$NAME" --kind "$AGENT_LAYOUT_KIND" \
-            --pane "$PANE" 2>&1 >/dev/null)"; then
-        say "$LABEL: $AGENT_LAYOUT_KIND started as \"$NAME\", $AGENT_LAYOUT_TOOL_COMMAND $AGENT_LAYOUT_TOOL_DIRECTION beside it, tab named $AGENT_LAYOUT_TAB_NAME"
-        exit 0
+find_cargo() {
+    if command -v cargo >/dev/null 2>&1; then
+        command -v cargo
+        return 0
     fi
+    for candidate in \
+        "${CARGO:-}" \
+        "${CARGO_HOME:-$HOME/.cargo}/bin/cargo" \
+        "$HOME/.cargo/bin/cargo" \
+        /opt/homebrew/opt/rustup/bin/cargo \
+        /opt/homebrew/bin/cargo \
+        /usr/local/opt/rustup/bin/cargo \
+        /usr/local/bin/cargo
+    do
+        [ -n "$candidate" ] && [ -x "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+    done
+    return 1
+}
 
-    case "$start_err" in
-        *'"code":"agent_not_ready"'*)
-            say "$LABEL: $AGENT_LAYOUT_KIND started as \"$NAME\" and is waiting on a prompt — layout done"
-            exit 0
-            ;;
-        *'"code":"agent_name_taken"'*)
-            [ -z "$NAME_ARG" ] || {
-                printf '%s\n' "$start_err" >&2
-                die "$LABEL: the agent name \"$NAME\" given with --agent-name is already taken"
-            }
-            try=$((try + 1))
-            [ "$try" -le "$NAME_MAX_TRIES" ] || {
-                printf '%s\n' "$start_err" >&2
-                die "$LABEL: every agent name from \"$NAME_BASE\" to \"$NAME\" is already taken"
-            }
-            suffix="-$try"
-            NAME="$(printf '%s' "$NAME_BASE" | cut -c"1-$((32 - ${#suffix}))")$suffix"
-            ;;
-        *)
-            printf '%s\n' "$start_err" >&2
-            die "$LABEL: panes laid out, but $AGENT_LAYOUT_KIND did not start as \"$NAME\""
-            ;;
-    esac
-done
+needs_build() {
+    [ -x "$BIN" ] || return 0
+    [ -n "$(find "$PLUGIN_ROOT/src" "$PLUGIN_ROOT/Cargo.toml" "$PLUGIN_ROOT/Cargo.lock" \
+            -newer "$BIN" -print -quit 2>/dev/null)" ]
+}
+
+if needs_build; then
+    CARGO_BIN="$(find_cargo || true)"
+    if [ -n "$CARGO_BIN" ]; then
+        say "building the layout binary"
+        CARGO_DIR="$(dirname -- "$CARGO_BIN")"
+        PATH="$CARGO_DIR:$PATH" "$CARGO_BIN" \
+            build --release --manifest-path "$PLUGIN_ROOT/Cargo.toml" >&2 \
+            || die "cargo build --release failed in $PLUGIN_ROOT"
+    elif [ -x "$BIN" ]; then
+        say "cargo not found; running the binary already built, which may be stale"
+    else
+        die "cargo not found, and no binary at $BIN — run \`cargo build --release\` in $PLUGIN_ROOT once"
+    fi
+fi
+
+[ -x "$BIN" ] || die "no layout binary at $BIN"
+
+exec "$BIN" "$@"
