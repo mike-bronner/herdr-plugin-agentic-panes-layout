@@ -31,6 +31,26 @@ running the files under a **real dash** and not only by reading them.
 `bin/agent-layout` ends in a python that dereferences the JSON it was piped, so
 a failed `herdr` leaves empty stdin and python exits non-zero on its own.
 
+## The Herdr version floor
+
+`min_herdr_version` is **0.8.2**, raised from 0.8.0 on 2026-09-09 for the 0.2.0
+release.
+
+The floor names the oldest Herdr the plugin was **observed** to work on, not the
+oldest one that might. The retry in "Deduping a derived name" below depends on
+`agent start` answering `agent_name_taken`, and that code is recorded in
+[`herdr-behaviour.md`](herdr-behaviour.md) as measured on 0.8.2 and confirmed on
+0.9.0. Nobody has run this plugin against 0.8.0 or 0.8.1.
+
+The failure that argument protects against is a quiet one. On a Herdr where the
+code differs or is absent, the retry never fires, the error falls through to the
+fatal arm, and a name collision goes back to leaving a workspace with panes and
+no agent. Silent degradation is the worst shape for a wrong compatibility claim,
+so the claim names a version somebody measured.
+
+The floor is stated in two places, `herdr-plugin.toml` and the README, and the
+suite fails when they disagree.
+
 ## Entry paths
 
 `bin/agent-layout` has three ways in, and they are equals:
@@ -52,10 +72,14 @@ A custom `AGENT_LAYOUT_RECIPE` is handed the same empty argument list.
 
 ### The third way in
 
-The third exists for `herdr-plugin-project-finder`, which builds these same
-three panes inline in its own `create_workspace()`. The recipe is duplicated
-across the two checkouts, and this is the plugin that owns it, so the picker
-calls this file instead.
+The third is for a program that creates workspaces it is not looking at, and
+then wants each one laid out. Such a caller runs this file instead of building
+the panes itself, and it must name the workspace it means, which is what
+`--workspace` is for. A project picker that opens a batch of workspaces
+unfocused is one example.
+
+This is the plugin that owns the recipe. A caller runs this copy rather than
+keeping one of its own.
 
 ## The arguments
 
@@ -65,9 +89,9 @@ bin/agent-layout [--workspace <id>] [--agent-name <name>]
 
 ### They are arguments, not settings
 
-Neither joins `bin/config-env`'s key set. The ten `AGENT_LAYOUT_` names are
-documented in both plugins' READMEs as one shared vocabulary of **user
-settings**, so a value learned in either place reads the same in the other. A
+Neither joins `bin/config-env`'s key set. The ten `AGENT_LAYOUT_` names are one
+vocabulary of **user settings**, so a value means the same thing wherever it is
+read, including in a caller that documents them alongside its own. A
 per-call argument hiding among them would let a stray `export` in an interactive
 shell silently retarget a keybinding press. An argument cannot leak that way,
 because it is passed per call or not at all.
@@ -101,10 +125,11 @@ Both choices come out of the same `workspace list`, so `--workspace` changes
 which **row** is picked and nothing else. `active_tab_id` and `label` are read
 off that row either way, and every step after resolution is identical.
 
-It exists because "which workspace is focused?" is the wrong question for the
-picker. That plugin is a reconciler: it opens N workspaces in one pass with
-`--no-focus` and only chooses a focus target at the end, so at the moment it
-wants each one laid out, none of them is focused.
+It exists because a caller can create a workspace without focusing it. For that
+caller, "which workspace is focused?" is the wrong question: the answer is some
+other workspace, or no workspace at all. It has to be able to name the one it
+means. A picker that opens several workspaces with `--no-focus` and chooses a
+focus target at the end is one caller in exactly that position.
 
 Asking the API stays the **default** because it is the right answer for the
 other two ways in. An event hook and a keybinding both mean "the workspace I am

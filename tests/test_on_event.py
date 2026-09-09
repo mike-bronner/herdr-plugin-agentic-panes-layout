@@ -544,12 +544,12 @@ ONE_BARE_PANE_IN_T7 = {"result": {"panes": [
 class LayoutCase(TempPluginCase):
     """bin/agent-layout run for real against a stub herdr binary.
 
-    TWO_WORKSPACES is the picker's situation, built so that targeting is
-    OBSERVABLE. The workspace --workspace names is deliberately NOT the focused
-    one, and differs from the focused one in every field the layout reads: a
-    different active tab, a different label (so a different derived agent name)
-    and a different cwd. Aiming at the focused workspace by mistake therefore
-    cannot produce a passing run.
+    TWO_WORKSPACES is a workspace that exists but is not focused, built so that
+    targeting is OBSERVABLE. The workspace --workspace names is deliberately NOT
+    the focused one, and differs from the focused one in every field the layout
+    reads: a different active tab, a different label (so a different derived
+    agent name) and a different cwd. Aiming at the focused workspace by mistake
+    therefore cannot produce a passing run.
     """
 
     def setUp(self):
@@ -949,7 +949,7 @@ class ArgumentParsing(LayoutCase):
 
     def test_both_flags_together_are_not_a_repeat(self):
         """The repeat check is per flag. Guarding them with one shared variable
-        would reject the picker's own call."""
+        would reject every call that passes both."""
         self.set_workspaces(TWO_WORKSPACES)
         self.set_panes(ONE_BARE_PANE_IN_T7)
         self.run_layout(["--workspace", "w7", "--agent-name", "reserved-2"])
@@ -1008,8 +1008,8 @@ class WorkspaceTargeting(LayoutCase):
         self.assertNotIn("cannot read a focused workspace", err)
 
     def test_no_focused_workspace_does_not_stop_a_targeted_run(self):
-        """The picker's own situation: it opens with --no-focus, so a pass can
-        reach this script with nothing focused at all."""
+        """A workspace can be created without ever being focused, so this
+        script can be reached with nothing focused at all."""
         self.set_workspaces({"result": {"workspaces": [
             {"workspace_id": "w7", "active_tab_id": "t7", "label": "other proj",
              "focused": False}]}})
@@ -1041,10 +1041,10 @@ class SuppliedAgentName(LayoutCase):
                          self.herdr_calls())
 
     def test_the_supplied_name_is_not_normalised(self):
-        """The load-bearing one. The picker reserves an exact string in its batch
-        set so `herdr agent prompt <name>` reaches the workspace, so this script
-        must not lowercase, prefix or truncate it. The derivation would turn each
-        of these into something else, which is why they are the fixture."""
+        """The load-bearing one. A caller reserves an exact string so
+        `herdr agent prompt <name>` reaches the workspace, so this script must
+        not lowercase, prefix or truncate it. The derivation would turn each of
+        these into something else, which is why they are the fixture."""
         for supplied in ("Weird_Name", "9leading", "x" * 40):
             with self.subTest(supplied=supplied):
                 self.reset_stub_state()
@@ -1065,9 +1065,8 @@ class SuppliedAgentName(LayoutCase):
         self.assertIn('claude started as "picked-name"', err)
 
     def test_the_name_is_supplied_alongside_a_targeted_workspace(self):
-        """Both flags at once, which is how the picker calls this script: it
-        detaches the whole call with the workspace it opened and the name it
-        reserved."""
+        """Both flags at once: a caller that targets a workspace it opened AND
+        reserved a name for must have both honoured in the same call."""
         self.set_workspaces(TWO_WORKSPACES)
         self.set_panes(ONE_BARE_PANE_IN_T7)
         self.run_layout(["--workspace", "w7", "--agent-name", "reserved-2"])
@@ -1083,9 +1082,6 @@ class DerivedNameCollision(LayoutCase):
     answers agent_name_taken to every caller alike, so it also sees a `claude`
     somebody started by hand and a second process racing this one. That is why
     the dedupe lives here rather than in a caller.
-
-    The derivation is byte-identical to herdr-plugin-project-finder's
-    agent_name(), suffix included, so the two cannot drift apart.
     """
 
     def starts(self):
@@ -1113,7 +1109,7 @@ class DerivedNameCollision(LayoutCase):
         self.assertEqual(len(self.starts()), 1)
 
     def test_the_base_is_trimmed_so_the_suffix_fits_in_32_characters(self):
-        """Herdr names are at most 32 characters, and the picker trims the BASE
+        """Herdr names are at most 32 characters, and this script trims the BASE
         rather than the suffix. Trimming the suffix instead would produce a
         33-character name that Herdr rejects, and would also let two different
         bases collapse onto one name."""
@@ -1239,6 +1235,20 @@ class Manifest(unittest.TestCase):
             asked = [line.split('"')[1] for line in f
                      if line.startswith("PLUGIN_ID = ")]
         self.assertEqual(declared, asked)
+
+    def test_the_readme_states_the_same_herdr_floor_as_the_manifest(self):
+        """min_herdr_version is a promise made to somebody who has not installed
+        this yet, and the README repeats it in prose, so it drifts the moment
+        one of the two moves. Two numbers that disagree are worse than either
+        alone: one of them is telling a reader their Herdr is new enough when it
+        is not. Why the floor sits where it does is in docs/design.md."""
+        with open(MANIFEST) as f:
+            floor = [line.split('"')[1] for line in f
+                     if line.startswith('min_herdr_version = "')]
+        self.assertEqual(len(floor), 1, floor)
+        with open(os.path.join(ROOT, "README.md")) as f:
+            readme = f.read()
+        self.assertIn("Requires Herdr %s or newer" % floor[0], readme)
 
     def test_the_readme_documents_exactly_the_settings_that_exist(self):
         """The README lists every key and its default by hand, so it drifts the

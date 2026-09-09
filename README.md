@@ -29,7 +29,7 @@ git clone git@github.com:mike-bronner/herdr-plugin-agentic-panes-layout.git
 herdr plugin link /absolute/path/to/herdr-plugin-agentic-panes-layout
 ```
 
-Requires Herdr 0.8.0 or newer. No other dependencies: `/bin/sh` and
+Requires Herdr 0.8.2 or newer. No other dependencies: `/bin/sh` and
 `/usr/bin/python3` are both spelled by absolute path, because Herdr's server
 runs under launchd with `PATH=/usr/bin:/bin:/usr/sbin:/sbin` and `/opt/homebrew`
 is not on it.
@@ -109,9 +109,11 @@ would break the guarantee the reservation was made for. An invalid name is
 Herdr's to reject, and the refusal is reported as a toast.
 
 There is no flag to skip the agent. The first pane always holds the preferred
-agent. A caller that must not block on `agent start` detaches the whole
-`bin/agent-layout` call and passes `--agent-name`, which gets the panes, the
-reserved name and no blocking wait together.
+agent, and `agent start` blocks for up to 30 seconds. A caller that must not
+wait that long detaches the whole `bin/agent-layout` call. Detaching is what
+buys that, on its own and with either flag or neither. `--agent-name` is a
+separate matter: it is for a caller that already reserved a name and needs Herdr
+to honour that exact string.
 
 These are per-call arguments and deliberately **not** settings, so neither has an
 `AGENT_LAYOUT_` equivalent. Those settings are one shared vocabulary, so a value
