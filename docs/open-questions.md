@@ -115,6 +115,87 @@ race, whatever it turns out to fire alongside.
 
 ---
 
+## Should the layout engine be rewritten on `layout.apply`?
+
+**Open, and worth doing for most of the engine. Not rejected.**
+
+`layout.apply` builds an entire tab from one recursive tree in a single call. This
+plugin instead issues N sequential `pane.split` calls, one `pane.rename` per label,
+and one `pane.send_input` per command. It would also remove the previous-pane-only
+split limitation entirely, because a tree can nest arbitrarily.
+
+It was measured on 0.9.0, 2026-09-09. The findings are recorded in full in
+[`herdr-behaviour.md`](herdr-behaviour.md); in short, with a `tab_id` it replaces the
+tab and the tab id changes, it kills a pane's agent unconditionally, and `pane_id` on
+a pane leaf is output-only.
+
+### One path of four is blocked, and it is not the common one
+
+Walking the paths this plugin actually has:
+
+| Path | Served by `layout.apply`? |
+| --- | --- |
+| Initial layout on `worktree.created`: a fresh tab, nothing to preserve | **Yes**, in one call. This is the common case. |
+| The `y` answer: destroy the tab and rebuild it clean | **Yes**, in one call. That is precisely what it does. |
+| The `esc` answer: change nothing | Not applicable, no engine needed. |
+| The `n` answer: keep the running agent and build the layout around it | **No.** |
+
+Only the last one is blocked, and the reason is specific: `pane_id` on a pane leaf is
+output-only, so an existing pane cannot be placed into a tree, and the agent's pane is
+exactly what has to be placed.
+
+**Destructiveness is explicitly not a blocker.** Replacing a tab wholesale is the
+desired behaviour for three of the four paths. It is only a problem for the one that
+must preserve something.
+
+Two costs previously recorded here were overstated and are corrected:
+
+- **A changed `tab_id` is harmless.** Verified in the code rather than assumed: the
+  guard matches on tab **name** (`tab_named` compares `label`), and `tab_id` is used
+  only to select a tab's panes from a list read fresh at the start of each run. No id
+  is cached across runs.
+- **The 180 existing tests being written against the incremental engine is a cost of
+  changing, not an argument against changing.**
+
+### The deciding question, which nobody has measured
+
+**What does `layout.apply` do with a pane leaf's `command`?**
+
+This plugin documents `command` as one line typed into the pane's **already-running
+interactive shell**, which is why unquoted flags work and why the user's shell rc
+setup applies — `lazygit` resolves because the pane's shell has the user's `PATH`. A
+`layout.apply` pane leaf takes an **argv array**. Those are not equivalent.
+
+Whoever picks this up should measure this first, because it decides whether the
+mismatch is real or imaginary:
+
+1. Does `layout.apply` **exec the argv directly**, or hand it to a shell?
+2. If a shell, is it an **interactive login** shell that sources the user's rc files,
+   or a bare non-interactive one?
+
+If it execs argv directly, or spawns a non-interactive shell, then a bare `lazygit`
+would stop resolving and `command = "git log --oneline -20"` would need splitting.
+Wrapping in `sh -c` does not rescue it: that is a fresh non-interactive shell which has
+never sourced the user's rc files. If instead it runs the argv inside an interactive
+shell, the mismatch is cosmetic and a one-element argv carries the line unchanged.
+
+`layout.export` is worth using either way: it returns the same tree shape the current
+engine builds, so it is a cheap check that a constructed tree is the shape the server
+understands.
+
+### What would unblock the fourth path
+
+`layout.apply` gaining a way to **place an existing pane** into a tree, making
+`pane_id` an input rather than output. That is the load-bearing one: it would turn
+"keep the agent and build around it" from a special case into a normal one, and a
+single call would then serve every path. A way to preserve or refuse on agent-bearing
+panes would do the same job by a different route.
+
+Until then, a rewrite would keep an incremental fallback for that one branch, which
+is a real design question rather than a blocker.
+
+---
+
 ## Herdr version drift
 
 Every measurement recorded in this repo was taken against Herdr **0.8.2**. Herdr

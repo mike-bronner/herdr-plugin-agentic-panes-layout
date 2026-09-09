@@ -12,25 +12,6 @@ say() {
 }
 die() { say "$*"; exit 1; }
 
-find_cargo() {
-    if command -v cargo >/dev/null 2>&1; then
-        command -v cargo
-        return 0
-    fi
-    for candidate in \
-        "${CARGO:-}" \
-        "${CARGO_HOME:-$HOME/.cargo}/bin/cargo" \
-        "$HOME/.cargo/bin/cargo" \
-        /opt/homebrew/opt/rustup/bin/cargo \
-        /opt/homebrew/bin/cargo \
-        /usr/local/opt/rustup/bin/cargo \
-        /usr/local/bin/cargo
-    do
-        [ -n "$candidate" ] && [ -x "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
-    done
-    return 1
-}
-
 needs_build() {
     [ -x "$BIN" ] || return 0
     [ -n "$(find "$PLUGIN_ROOT/src" "$PLUGIN_ROOT/Cargo.toml" "$PLUGIN_ROOT/Cargo.lock" \
@@ -38,17 +19,12 @@ needs_build() {
 }
 
 if needs_build; then
-    CARGO_BIN="$(find_cargo || true)"
-    if [ -n "$CARGO_BIN" ]; then
-        say "building the layout binary"
-        CARGO_DIR="$(dirname -- "$CARGO_BIN")"
-        PATH="$CARGO_DIR:$PATH" "$CARGO_BIN" \
-            build --release --manifest-path "$PLUGIN_ROOT/Cargo.toml" >&2 \
-            || die "cargo build --release failed in $PLUGIN_ROOT"
+    if HERDR_PLUGIN_ROOT="$PLUGIN_ROOT" sh "$PLUGIN_ROOT/bin/build"; then
+        :
     elif [ -x "$BIN" ]; then
-        say "cargo not found; running the binary already built, which may be stale"
+        say "the build failed; running the binary already built, which may be stale"
     else
-        die "cargo not found, and no binary at $BIN — run \`cargo build --release\` in $PLUGIN_ROOT once"
+        die "no layout binary at $BIN and it could not be built"
     fi
 fi
 

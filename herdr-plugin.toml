@@ -1,9 +1,26 @@
 id = "mikebronner.agentic-panes-layout"
 name = "Agentic Panes Layout"
-version = "0.3.0"
-min_herdr_version = "0.8.2"
+version = "0.4.0"
+min_herdr_version = "0.9.0"
 description = "Lay out a workspace from a declarative TOML file: tabs, panes, commands, agents"
 platforms = ["macos", "linux"]
+
+[[build]]
+command = ["sh", "bin/build"]
+
+[[actions]]
+id = "apply"
+title = "Apply agent layout"
+contexts = ["workspace", "global"]
+command = ["sh", "bin/agent-layout", "--rebuild"]
+
+[[panes]]
+id = "confirm"
+title = "Agent layout"
+placement = "popup"
+width = "60%"
+height = "30%"
+command = ["sh", "bin/agent-layout", "--confirm"]
 
 [[events]]
 on = "worktree.created"

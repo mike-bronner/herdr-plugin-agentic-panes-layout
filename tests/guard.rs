@@ -1,5 +1,11 @@
 //! The re-run guard, which is tab-name based, and its three first-tab cases.
 //!
+//! The guard belongs to the **automatic** path. `worktree.created` fires without
+//! anybody asking, so a second event must not rebuild a workspace nobody asked to
+//! rebuild. Tests that exercise the guard therefore invoke the way the hook does,
+//! through `on_event` below; a bare invocation means a human asked and rebuilds
+//! instead, which is tests/rebuild.rs.
+//!
 //! v0.2.0 guarded on the pane count of the active tab: more than one pane, or a
 //! pane already hosting an agent, and the whole run was refused. That made a
 //! partly applied layout permanently unfinishable. The guard is now per tab and
@@ -15,6 +21,18 @@ mod support;
 
 use serde_json::json;
 use support::*;
+
+/// Invoke the way `bin/on-event` does: the automatic path, which wants the guard.
+fn on_event(stub: &Stub, config_root: Option<&std::path::Path>) -> Run {
+    let payload =
+        json!({"data": {"workspace": {"workspace_id": "w9", "focused": true}}}).to_string();
+    run_with_env(
+        stub,
+        &["--from-event"],
+        config_root,
+        &[("HERDR_PLUGIN_EVENT_JSON", &payload)],
+    )
+}
 
 fn two_tab_config() -> (TempDir, std::path::PathBuf) {
     let dir = TempDir::new();
@@ -43,7 +61,7 @@ fn a_tab_whose_name_already_exists_is_skipped() {
         tabs: tabs_labelled(&["agent"]),
         ..Script::default()
     });
-    let run = run(&stub, &[], None);
+    let run = on_event(&stub, None);
     assert_eq!(run.status, 0, "{}", run.stderr);
     assert!(
         run.says("left agent alone, already there"),
@@ -156,7 +174,7 @@ fn a_partly_applied_layout_is_resumed_rather_than_refused() {
         tabs: tabs_labelled(&["agent"]),
         ..Script::default()
     });
-    let run = run(&stub, &[], Some(root.as_path()));
+    let run = on_event(&stub, Some(root.as_path()));
     assert_eq!(run.status, 0, "{}", run.stderr);
     assert!(stub.params_for("tab.rename").is_empty());
     assert_eq!(stub.params_for("tab.create").len(), 1);
@@ -173,7 +191,7 @@ fn a_fully_applied_layout_changes_nothing_at_all() {
         tabs: tabs_labelled(&["agent", "notes"]),
         ..Script::default()
     });
-    let run = run(&stub, &[], Some(root.as_path()));
+    let run = on_event(&stub, Some(root.as_path()));
     assert_eq!(run.status, 0, "{}", run.stderr);
     assert!(stub.changing().is_empty(), "{:?}", stub.changing());
 }

@@ -174,7 +174,13 @@ pub fn panes(client: &Client, workspace_id: &str) -> Result<Vec<Pane>, CallError
         .collect())
 }
 
-pub fn tab_labels(client: &Client, workspace_id: &str) -> Result<Vec<String>, CallError> {
+#[derive(Debug, Clone)]
+pub struct TabInfo {
+    pub tab_id: String,
+    pub label: String,
+}
+
+pub fn tabs(client: &Client, workspace_id: &str) -> Result<Vec<TabInfo>, CallError> {
     let result = client.call("tab.list", json!({"workspace_id": workspace_id}))?;
     let listed = result
         .get("tabs")
@@ -183,7 +189,12 @@ pub fn tab_labels(client: &Client, workspace_id: &str) -> Result<Vec<String>, Ca
         .unwrap_or_default();
     Ok(listed
         .iter()
-        .filter_map(|t| string_at(t, "label"))
+        .filter_map(|t| {
+            Some(TabInfo {
+                tab_id: string_at(t, "tab_id")?,
+                label: string_at(t, "label").unwrap_or_default(),
+            })
+        })
         .collect())
 }
 

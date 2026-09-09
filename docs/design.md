@@ -44,26 +44,58 @@ The shim rebuilds when the binary is missing or when anything in `src/`,
 `Cargo.toml` or `Cargo.lock` is newer than it. Cargo takes its own lock, so two
 hooks firing a millisecond apart do not race: the second waits.
 
-**Herdr does have a `[[build]]` lifecycle, and it is deliberately not used
-here.** `src/app/api/plugins/manifest.rs` parses `build` alongside `startup`,
-`actions`, `events` and `panes` at both v0.8.2 and v0.9.0, each entry carrying
-`platforms` and `command`; Herdr's own test asserts a `["bun", "install"]`
-command, and `mikebronner.project-finder` already declares a `[[build]]` entry of
-its own. So the choice is between two working mechanisms rather than a workaround
-for a missing one.
+The manifest **also** declares a `[[build]]` step. Both mechanisms are used,
+because each covers exactly what the other cannot.
 
-Build-on-first-use wins for this plugin because it is **linked from a working
-copy** rather than installed from a release. `herdr plugin link` points Herdr at a
-checkout that is still being edited, and a `[[build]]` entry runs once at link
-time: edit `src/layout.rs` afterwards and Herdr keeps running the stale binary
-until somebody remembers to relink. The shim's staleness check is what makes an
-edit take effect on the next event, which is the same property Herdr itself has
-for `herdr-plugin.toml`.
+### When `[[build]]` runs, measured rather than assumed
 
-The cost is a slow first event after a source change, which is why the README
-tells the reader to run `cargo build --release` once. A `[[build]]` entry would be
-the better choice for a released binary plugin, and is worth revisiting if this
-one ever ships that way.
+This has been got wrong twice in this file's history, in both directions, so the
+lifecycle is written down narrowly and with its evidence.
+
+`[[build]]` fires **once, on `herdr plugin install owner/repo`**, after the
+confirmation prompt and before Herdr registers the plugin. Per Herdr's plugin
+documentation: "Build commands run during GitHub `plugin install` after
+confirmation and before Herdr registers the plugin", and "`plugin link` does not
+run build commands; local authors build their working tree themselves."
+
+Measured 2026-09-09 in an isolated server, to check the half that is testable
+locally. A throwaway plugin declaring
+`[[build]] command = ["/bin/sh", "-c", "date > /private/tmp/hbld/BUILD_RAN"]` was
+linked with `herdr plugin link`:
+
+- The marker file was **never created**, so the build command did not run.
+- The plugin registered anyway, and `plugin list` showed it enabled.
+- `[[build]]` **was** parsed: the `plugin_linked` answer echoed the whole `build`
+  array back.
+
+So `[[build]]` is real and understood at 0.9.0, and `link` does not trigger it.
+
+It does **not** run on link, and it does **not** run on update. That is the whole
+reason the shim exists rather than being a fallback for a missing feature:
+
+| Path | Covered by |
+| --- | --- |
+| `herdr plugin install owner/repo` | `[[build]]` |
+| `herdr plugin link <path>`, a working copy | **the shim only** |
+| A source edit in a linked checkout | **the shim only** |
+| A plugin update | **the shim only** |
+
+Herdr installs no toolchains and reports a build failure rather than resolving
+it, and its documentation tells authors to document the tools they need. Hence the
+cargo requirement in the README.
+
+### Why both
+
+`[[build]]` earns its place for somebody installing from GitHub: without it, their
+**first worktree creation** stalls for a minute inside an event hook while cargo
+compiles, with nothing but a toast to explain the pause. With it, the compile is a
+visible step at install time and a failure is reported where the user is already
+looking.
+
+The shim earns its place for every other path in that table, and especially for
+this repository's own normal state: linked from a working copy that is still being
+edited. An edit to `src/layout.rs` takes effect on the next event, which is the
+same property Herdr itself has for `herdr-plugin.toml`.
 
 ### The shim cannot assume cargo is on `PATH`
 
@@ -119,9 +151,14 @@ Every method this plugin sends exists at **protocol 20**, which is Herdr 0.8.2:
 `notification.show`. `herdr tab create` was separately confirmed to exist at
 v0.8.2 with identical flags.
 
-Raising the floor was considered when multi-tab support went in, and rejected: a
-floor that excludes users for no measured reason is worse than no floor. The
-floor is stated in two places, `herdr-plugin.toml` and the README, and the suite
+The floor is nonetheless **0.9.0**, to match the one
+`mikebronner.project-finder` declares. That is a consistency decision across two
+plugins with one maintainer, taken with the measurement above in front of it, and not
+a technical requirement — nothing here needs anything newer than protocol 20. The
+distinction is worth keeping straight, because a reader who assumes the floor is
+technical will not think to lower it if the consistency reason ever goes away.
+
+The floor is stated in two places, `herdr-plugin.toml` and the README, and the suite
 fails when they disagree.
 
 There is **no version negotiation** in the protocol, but `ping` returns
@@ -237,6 +274,160 @@ is resumable, so an honest non-zero exit costs nothing.
 
 The guard reads the tab list of the workspace **being laid out**, so it guards a
 `--workspace` target as readily as a focused one.
+
+### The guard belongs to the automatic path only
+
+The guard is right when the trigger is `worktree.created` and wrong when a human
+pressed a key. Asking for a layout explicitly is a statement of intent, and a
+guard that silently ignores it is answering a question the user did not ask.
+
+So an existing tab means two different things:
+
+| Invoked by | Existing tab of the layout's name |
+| --- | --- |
+| `bin/on-event`, which passes `--from-event` | **skipped** |
+| Anything else, including the keybinding | **rebuilt** |
+
+**Only the automatic path opts in, and that direction was chosen deliberately.** The
+obvious design is a `--rebuild` flag that the human-facing entry points pass, with
+skipping as the default. It was rejected because the README documented a
+`[[keys.command]]` entry passing **no arguments**, and a live `config.toml` matched
+it: making rebuild opt-in would have left that binding silently skipping until it was
+edited. So the **event hook** declares that it is the automatic path, and anything
+else means a human asked. A test reads the README's documented shell binding and fails
+if it ever grows a flag.
+
+`--rebuild` exists anyway, as an explicit synonym for the default, because the
+manifest's `[[actions]]` entry passes it. That way the manifest reads as what it does
+rather than relying on the absence of arguments to convey intent.
+
+## The action, and why the manifest cannot carry the keybinding
+
+`[[actions]]` declares `mikebronner.agentic-panes-layout.apply`, whose command is the
+shim with `--rebuild`. It is reachable from Herdr's action menu, from
+`herdr plugin action invoke`, and from a user binding of
+`type = "plugin_action"`.
+
+**A plugin manifest cannot declare a keybinding.** There is no `keys` field in a
+plugin manifest at either version, so a `[[keys.command]]` block placed inside one is
+silently ignored — `razajamil/herdr-plugin-workspace-manager` ships exactly such a
+dead block. The user's own `config.toml` is the only place a binding can live.
+
+What the action buys over the `type = "shell"` form, in increasing order of weight:
+there is no absolute path to get wrong, it survives the checkout moving, and — the
+real one — a `type = "shell"` process is handed `HERDR_ACTIVE_*`, `HERDR_BIN_PATH`,
+`HERDR_SOCKET_PATH` and `HERDR_SESSION` but **no `HERDR_PLUGIN_ROOT`**, which is the
+entire reason the shell form needs an absolute path. An action is given plugin
+context, so the requirement disappears.
+
+**The action's command is the shim, not `target/release/agent-layout`.**
+`NathanFlurry/herdr-plugin-jj-workspace` points its actions and panes straight at the
+built binary; doing that here would skip the staleness rebuild that a linked working
+copy depends on.
+
+## Rebuilding a tab
+
+A rebuild empties the tab down to one surviving pane and builds the layout from it.
+The survivor is the tab's first pane, unless an agent changes that.
+
+### Closing a pane running an agent needs consent
+
+An agent mid-turn holds work that cannot be recovered, so a rebuild that would
+close one **asks first**, in a popup. There is no force flag: the question is the
+mechanism. It takes **one keypress**, and there are **three** answers.
+
+| Key | Word on the wire | What happens |
+| --- | --- | --- |
+| `y` | `close` | The agent's pane is closed and the tab is rebuilt clean. |
+| `n` | `keep` | The agent's pane becomes the survivor, keeps running, and the tab is rebuilt **around** it. |
+| `esc` | `nothing` | **Not one pane of the tab is touched.** |
+
+**`esc` is not a synonym for `n`, and that distinction is the point of having it.**
+`n` still closes every non-agent pane in the tab and rebuilds the layout, so without
+a third choice the cheapest available answer costs a rearranged workspace. A misfire
+has to be free.
+
+Everything that is not one of the three words means `esc`: a dismissed popup, a
+popup that could not be opened, a popup that never started, a timeout, an answer
+nobody recognises. A popup the user closed or ignored is the same class of event as a
+misfire, so it costs the same nothing. **Acting on silence is the thing being
+prevented**, and each of those paths says which one happened, because a silent no-op
+after a keypress reads as a broken keybinding.
+
+`n` does not abort the run, because that would leave the user with neither the old
+layout nor the new one. It works around the survivor: the tab is split out from it,
+the other panes are rebuilt, and the survivor is relabelled as the layout's first
+pane. Two things are deliberately **not** done to it — no second agent is started in
+it, and no `command` is typed into it, because its foreground process is an agent and
+text sent there is a prompt rather than a shell command.
+
+**A rebuild that touches no agent pane asks nothing at all.** Nothing is at risk, so
+there is nothing to consent to, and a popup there would make the common case slow for
+no reason. That is why `NeverShown` is only ever reachable when a pane really is in
+danger: the two situations are separated before the question is asked, not after.
+
+### Why one keypress and no ratatui
+
+`crossterm 0.29` reads the key; there is no ratatui. A yes/no/cancel needs no
+widgets, no layout engine and no render loop, and Herdr already draws the pane frame
+and puts the manifest's `title` on it. Three `println!`s and one key is the whole
+interface. The version is pinned to what Herdr's own `Cargo.toml` uses, which keeps
+the property that every crate here is one Herdr already depends on.
+
+Raw mode needs a tty. The popup always has one, being a real pane; a test harness
+piping stdin does not. Rather than fail there, it falls back to reading a line, which
+keeps the three choices answerable either way — and means the fallback is exercised
+by the suite instead of being untested code that only runs once something has gone
+wrong.
+
+### Why the answer travels through a file, and why the popup reports its own pid
+
+A plugin pane is a **separate process**, so whatever it learns from the user has to
+reach the process applying the layout. This side creates a directory, hands two file
+paths to the popup through `plugin.pane.open`'s `env` map, and polls. The popup is
+this same binary under `--confirm`, so the question is worded in one place and there
+is one language.
+
+Three measured facts force the design, and each was checked rather than assumed:
+
+1. `plugin.pane.open` answers `{"type":"ok"}` and **nothing else** — no pane id.
+2. **A plugin pane does not appear in `pane.list`.**
+3. The pane's command process **does** run, including on a server with no UI client.
+
+So Herdr hands back no handle at all, and there is nothing to poll for. The popup
+therefore reports **itself**: it writes its own process id to a `started` file before
+drawing anything. The wait then ends on the first of four things — the answer file
+being written, the started file failing to appear within 3 seconds, the reported
+process dying, or a 120-second deadline.
+
+The pid check earns its place because Herdr may kill the popup outright when the pane
+is closed, so the popup cannot be relied on to write an answer on its way out.
+Without it, a dismissed popup would hang the rebuild for two minutes. It uses
+`/bin/kill -0`, a signal-free existence test, at a slower cadence than the file poll
+because each check spawns a process; a libc dependency for one syscall is a
+supply-chain surface this plugin does not need.
+
+The 3-second startup bound catches a popup whose process never launched. It does
+**not** catch a popup that launched and is never answered because nothing is
+displaying it; that runs out the full timeout and then changes nothing, which is slow
+but safe.
+
+**A neighbouring plugin avoids this problem rather than solving it, and the shape
+does not transfer.** `mikebronner.project-finder`'s picker makes its popup *the
+acting process*: `bin/pick-project` runs as the pane, reads the selection
+in-process, and makes its own API calls, so nothing is reported back. That works
+because the picker's popup is the **entry point** — the user invokes the picker.
+Here the popup is an **interruption** partway through an operation that is already
+running: the config is read, the target resolved, and earlier tabs possibly already
+built before the question arises. Moving the layout into the popup would mean
+running it there on the refusal path too, which would put a popup on screen for
+every rebuild including the ones that need no question at all.
+
+`NathanFlurry/herdr-plugin-jj-workspace` is the closest precedent in the
+ecosystem, and it pairs `[[actions]]` with an `overlay` pane rather than solving a
+cross-process handoff. It also points its manifest straight at
+`./target/release/<name>`; **this plugin deliberately does not**, because that
+skips the shim and with it the staleness rebuild a linked checkout depends on.
 
 It makes a **later** run safe, not a **simultaneous** one. Two concurrent copies
 would both read a tab list without their own tab in it and both build. See

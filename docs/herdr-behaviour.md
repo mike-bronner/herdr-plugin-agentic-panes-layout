@@ -488,6 +488,72 @@ The absence of the key does not always mean no agent: immediately after
 reported no `agent` and `agent_status: "unknown"`. The guard reading `agent` is
 therefore a check on a **settled** agent, which is what v0.2.0 also did.
 
+### `plugin.pane.open` tells you nothing about the pane it opens
+
+Measured on 0.9.0, 2026-09-09. Three separate findings, each of which shaped this
+plugin's confirmation popup:
+
+1. **It answers `{"type":"ok"}` and nothing else.** No pane id, no tab id. So the
+   pane cannot afterwards be polled for, focused, or closed by id — and
+   `plugin.pane.close` takes a `pane_id`, so it is unreachable for a pane opened this
+   way.
+2. **A plugin pane does not appear in `pane.list`.** Confirmed while a plugin pane's
+   process was demonstrably running: `pane.list` returned only the workspace's three
+   ordinary panes.
+3. **The pane's command process does run**, even with no UI client attached to the
+   server. Observed directly: `pgrep` found the `--confirm` process alive after the
+   action was invoked against a headless `herdr --session ... server`.
+
+Finding 3 corrects an earlier reading of finding 2. The absence of a pane from
+`pane.list` is **not** evidence that no pane was created or that no process was
+launched; it is only evidence that plugin panes are not listed there.
+
+The consequence for any plugin that needs an answer back from a popup: Herdr provides
+no handle, so **the popup has to report itself**. This plugin has it write its own
+process id to a file whose path travels in `plugin.pane.open`'s `env` map.
+
+`[[panes]]` accepts `width` and `height` only when `placement = "popup"`. The
+placement enum is `overlay`, `popup`, `split`, `tab`, `zoomed`.
+
+### `layout.apply` builds a whole tab in one call, and destroys the old one
+
+Measured on 0.9.0, 2026-09-09, in an isolated server. Present at protocol 20 too.
+It takes a recursive `LayoutNode` tree — `{type: "pane", command, cwd, env, label,
+pane_id}` or `{type: "split", direction, ratio, first, second}` — plus
+`workspace_id`, `tab_id`, `tab_label` and `focus`.
+
+**Three findings, each measured rather than inferred from the schema.**
+
+**1. With a `tab_id` it replaces the tab wholesale, and the tab id changes.** A
+two-pane tree applied to a tab holding three panes left the tab gone: `tab_id`
+`w1:t1` became `w1:t2`, and `w1:p1`, `w1:p2` and `w1:p3` no longer existed. So it is
+not "rearrange this tab", it is "replace this tab with a new one". `tab_label` is
+honoured, so the name can be carried across; nothing else is.
+
+With a `workspace_id` and **no** `tab_id` it **adds** a tab instead, leaving
+existing tabs alone.
+
+**2. It kills a pane's agent unconditionally.** A tree that did not mention a pane
+reporting `agent: "claude"` destroyed that pane, and `agent.list` came back empty.
+It does not refuse, does not warn, and does not relocate the agent.
+
+**3. `pane_id` on a pane leaf is output-only.** `layout.export` fills it in, and
+`layout.apply` **ignores it on input**. A leaf naming the live pane `w1:p6` produced
+a brand-new `w1:p8`; the agent died and the old label was dropped. It cannot place
+an existing pane into a new tree.
+
+Two further details worth knowing before using it:
+
+- **`command` on a pane leaf is an argv array**, not a shell command line. That is a
+  different contract from `pane.send_input`, which types a line into the pane's own
+  interactive shell and therefore takes flags unquoted.
+- **`layout.export` is the exact inverse** and takes a `tab_id` or `pane_id`. A tab
+  built with sequential `pane.split` calls exports as the same tree shape this
+  plugin constructs, which is a cheap way to confirm a tree is well formed.
+
+`layout.set_split_ratio` is the third of the family, addressing a split by a `path`
+of booleans from the root.
+
 ### `notification.show` can succeed and show nothing
 
 ```json

@@ -1,0 +1,35 @@
+#!/bin/sh
+set -eu
+
+PLUGIN_ROOT="${HERDR_PLUGIN_ROOT:-$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)}"
+
+note() { printf 'agent-layout: %s\n' "$*" >&2; }
+die() { note "$*"; exit 1; }
+
+find_cargo() {
+    if command -v cargo >/dev/null 2>&1; then
+        command -v cargo
+        return 0
+    fi
+    for candidate in \
+        "${CARGO:-}" \
+        "${CARGO_HOME:-$HOME/.cargo}/bin/cargo" \
+        "$HOME/.cargo/bin/cargo" \
+        /opt/homebrew/opt/rustup/bin/cargo \
+        /opt/homebrew/bin/cargo \
+        /usr/local/opt/rustup/bin/cargo \
+        /usr/local/bin/cargo
+    do
+        [ -n "$candidate" ] && [ -x "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+    done
+    return 1
+}
+
+CARGO_BIN="$(find_cargo || true)"
+[ -n "$CARGO_BIN" ] || die "cargo not found; install a Rust toolchain (1.74 or newer), then run \`cargo build --release\` in $PLUGIN_ROOT"
+
+CARGO_DIR="$(dirname -- "$CARGO_BIN")"
+note "building the layout binary with $CARGO_BIN"
+PATH="$CARGO_DIR:$PATH" "$CARGO_BIN" \
+    build --release --manifest-path "$PLUGIN_ROOT/Cargo.toml" >&2 \
+    || die "cargo build --release failed in $PLUGIN_ROOT"

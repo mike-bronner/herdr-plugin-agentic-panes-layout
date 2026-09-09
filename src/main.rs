@@ -1,7 +1,7 @@
 use std::process::Command;
 
 use agent_layout::api::{self, Client};
-use agent_layout::{config, layout};
+use agent_layout::{config, confirm, layout};
 
 fn main() {
     let code = match run() {
@@ -22,6 +22,8 @@ struct Args {
     workspace: Option<String>,
     agent_name: Option<String>,
     from_event: bool,
+    confirm: bool,
+    rebuild: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -29,6 +31,8 @@ fn parse_args() -> Result<Args, String> {
         workspace: None,
         agent_name: None,
         from_event: false,
+        confirm: false,
+        rebuild: false,
     };
     let mut raw = std::env::args().skip(1);
     while let Some(flag) = raw.next() {
@@ -38,6 +42,18 @@ fn parse_args() -> Result<Args, String> {
                     return Err("--from-event given more than once".to_string());
                 }
                 args.from_event = true;
+            }
+            "--confirm" => {
+                if args.confirm {
+                    return Err("--confirm given more than once".to_string());
+                }
+                args.confirm = true;
+            }
+            "--rebuild" => {
+                if args.rebuild {
+                    return Err("--rebuild given more than once".to_string());
+                }
+                args.rebuild = true;
             }
             "--workspace" => {
                 if args.workspace.is_some() {
@@ -84,9 +100,26 @@ fn event_workspace_is_focused() -> bool {
 fn run() -> Result<(), Exit> {
     let args = parse_args().map_err(Exit)?;
 
+    // The popup pane runs this same binary. It talks to a terminal and a file, not
+    // to the socket, so it returns before anything else is resolved.
+    if args.confirm {
+        return confirm::run_popup().map_err(Exit);
+    }
+
     if args.from_event && !event_workspace_is_focused() {
         return Ok(());
     }
+
+    // Only the automatic path wants the guard. `--rebuild` is the explicit way to ask
+    // for the other behaviour and is what the manifest's `[[actions]]` entry passes,
+    // so the manifest reads as what it does. It is also the default for a bare
+    // invocation, which is what keeps the README's documented `[[keys.command]]`
+    // shell binding working without an edit.
+    let on_existing = if args.from_event && !args.rebuild {
+        layout::OnExisting::Skip
+    } else {
+        layout::OnExisting::Rebuild
+    };
 
     let client = Client::from_env().map_err(|e| Exit(format!("cannot reach Herdr: {}", e)))?;
 
@@ -110,14 +143,12 @@ fn run() -> Result<(), Exit> {
 
     let all_panes = api::panes(&client, &target.workspace_id)
         .map_err(|e| Exit(format!("{}: cannot list the panes: {}", target.label, e)))?;
-    let active_panes: Vec<api::Pane> = all_panes
+    let tabs = api::tabs(&client, &target.workspace_id)
+        .map_err(|e| Exit(format!("{}: cannot list the tabs: {}", target.label, e)))?;
+
+    let cwd = all_panes
         .iter()
         .filter(|p| p.tab_id == target.active_tab_id)
-        .cloned()
-        .collect();
-
-    let cwd = active_panes
-        .iter()
         .find_map(|p| p.cwd.clone())
         .ok_or_else(|| {
             Exit(format!(
@@ -141,7 +172,8 @@ fn run() -> Result<(), Exit> {
         workspace_id: target.workspace_id.clone(),
         label: target.label.clone(),
         active_tab_id: target.active_tab_id.clone(),
-        active_panes,
+        panes: all_panes,
+        tabs,
     };
 
     let outcome = layout::apply(
@@ -150,6 +182,7 @@ fn run() -> Result<(), Exit> {
         &chosen.layout,
         args.agent_name.as_deref(),
         &cwd,
+        on_existing,
     )
     .map_err(|layout::Fatal(message)| Exit(message))?;
 
@@ -178,6 +211,9 @@ fn summary(
     let mut parts = Vec::new();
     if !outcome.built.is_empty() {
         parts.push(format!("laid out {}", outcome.built.join(", ")));
+    }
+    if !outcome.rebuilt.is_empty() {
+        parts.push(format!("rebuilt {}", outcome.rebuilt.join(", ")));
     }
     if !outcome.skipped.is_empty() {
         parts.push(format!(

@@ -80,6 +80,16 @@ pub struct Script {
     pub agent_error: Option<String>,
     /// Fail only the Nth call to `pane.split`, 1-based.
     pub fail_split: Option<u32>,
+    /// What the confirmation popup "answers".
+    ///
+    /// The real popup is a separate process that writes into a file whose path
+    /// arrives in `plugin.pane.open`'s `env`. The stub plays the user: it writes
+    /// this straight into that file, so the waiting side is exercised for real
+    /// rather than stubbed out. `None` writes nothing, which is the timeout path.
+    pub popup_answer: Option<String>,
+    /// The popup appears and then dies without answering, which is what closing the
+    /// pane does.
+    pub popup_dies_unanswered: bool,
 }
 
 impl Default for Script {
@@ -92,6 +102,8 @@ impl Default for Script {
             taken_names: HashSet::new(),
             agent_error: None,
             fail_split: None,
+            popup_answer: None,
+            popup_dies_unanswered: false,
         }
     }
 }
@@ -114,6 +126,18 @@ impl Script {
 
     pub fn fail_split(mut self, nth: u32) -> Script {
         self.fail_split = Some(nth);
+        self
+    }
+
+    /// The user answers the confirmation popup this way.
+    pub fn answers(mut self, answer: &str) -> Script {
+        self.popup_answer = Some(answer.to_string());
+        self
+    }
+
+    /// The popup opens and is then closed without an answer.
+    pub fn popup_dismissed(mut self) -> Script {
+        self.popup_dies_unanswered = true;
         self
     }
 }
@@ -249,6 +273,7 @@ impl Stub {
                         | "pane.rename"
                         | "pane.send_input"
                         | "agent.start"
+                        | "pane.close"
                 )
             })
             .collect()
@@ -344,9 +369,54 @@ fn answer_for(
                                   "agent": {"name": name}})),
             }
         }
+        "pane.close" => ok(json!({"type": "ok"})),
+        "plugin.pane.open" => {
+            // Play both Herdr and the user. The two file paths arrive in `env`,
+            // exactly as the real popup process would receive them, so the waiting
+            // side is exercised for real rather than stubbed out.
+            //
+            // The started marker carries this test process's own id, because a live
+            // pid is what "the popup is still up" looks like. Writing neither file is
+            // what a server with no attached UI client produces: `ok`, and no pane.
+            let env = params.get("env");
+            let path_for = |key: &str| {
+                env.and_then(|e| e.get(key))
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_string())
+            };
+            if let Some(answer) = &script.popup_answer {
+                if let Some(started) = path_for("AGENT_LAYOUT_STARTED_FILE") {
+                    let _ = std::fs::write(started, std::process::id().to_string());
+                }
+                if let Some(path) = path_for("AGENT_LAYOUT_ANSWER_FILE") {
+                    let _ = std::fs::write(path, answer);
+                }
+            } else if script.popup_dies_unanswered {
+                if let Some(started) = path_for("AGENT_LAYOUT_STARTED_FILE") {
+                    let _ = std::fs::write(started, dead_pid());
+                }
+            }
+            // Measured on 0.9.0: the real answer is exactly this, with no pane id.
+            ok(json!({"type": "ok"}))
+        }
+        "plugin.pane.close" => ok(json!({"type": "ok"})),
         "notification.show" => ok(json!({"type": "notification_show", "shown": false})),
         _ => fail("unhandled_by_stub"),
     }
+}
+
+/// A process id that is certainly not running.
+///
+/// Spawned and reaped, so the id is real and freed rather than made up. Reuse is
+/// possible in principle and vanishingly unlikely inside one short test run.
+fn dead_pid() -> String {
+    let child = Command::new("/usr/bin/true")
+        .spawn()
+        .expect("cannot spawn /usr/bin/true");
+    let pid = child.id();
+    let mut child = child;
+    let _ = child.wait();
+    pid.to_string()
 }
 
 pub struct Run {

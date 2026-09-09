@@ -77,14 +77,79 @@ fn every_event_dispatches_the_hook_and_nothing_else() {
 }
 
 #[test]
-fn the_herdr_floor_stays_where_every_method_is_available() {
-    // Every method this plugin sends exists at protocol 20, which is Herdr 0.8.2,
-    // and `herdr tab create` exists there with identical flags. A floor that
-    // excluded users for no measured reason would be worse than no floor.
+fn the_herdr_floor_matches_the_sibling_plugin() {
+    // 0.9.0 matches `mikebronner.project-finder`, which declares the same. It is a
+    // consistency decision across Mike's two plugins rather than a technical
+    // requirement: every method this plugin sends exists at protocol 20, which is
+    // 0.8.2, and that was measured rather than assumed.
     assert_eq!(
         manifest()["min_herdr_version"].as_str(),
-        Some("0.8.2"),
-        "the floor moved; re-measure the protocol before changing this"
+        Some("0.9.0"),
+        "the floor moved; it tracks the sibling plugin, not the protocol"
+    );
+}
+
+#[test]
+fn the_manifest_declares_the_action_the_keybinding_names() {
+    // A plugin manifest cannot declare keybindings: RawPluginManifest has no `keys`
+    // field at either version, so a [[keys.command]] block inside one is silently
+    // ignored. What it can declare is an action, which the user's own binding then
+    // names as `type = "plugin_action"`.
+    //
+    // The action's command is the shim, not target/release, so a linked checkout still
+    // rebuilds when its sources change.
+    let parsed = manifest();
+    let actions = parsed["actions"]
+        .as_array()
+        .expect("[[actions]] must be an array");
+    assert_eq!(actions.len(), 1);
+    let action = &actions[0];
+    assert_eq!(action["id"].as_str(), Some("apply"));
+    let command: Vec<String> = action["command"]
+        .as_array()
+        .expect("an action needs a command")
+        .iter()
+        .map(|c| c.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(command, vec!["sh", "bin/agent-layout", "--rebuild"]);
+}
+
+#[test]
+fn the_readme_documents_the_plugin_action_binding_that_the_manifest_provides() {
+    // The binding a reader copies is `<plugin id>.<action id>`, so it drifts the
+    // moment either half moves. Two of them disagreeing is worse than one alone: the
+    // reader's keybinding silently does nothing.
+    let parsed = manifest();
+    let expected = format!(
+        "{}.{}",
+        parsed["id"].as_str().unwrap(),
+        parsed["actions"].as_array().unwrap()[0]["id"]
+            .as_str()
+            .unwrap()
+    );
+    let readme = read("README.md");
+    assert!(
+        readme.contains(&expected),
+        "the README does not name the action {}",
+        expected
+    );
+    assert!(
+        readme.contains("type = \"plugin_action\""),
+        "the README must document the plugin_action form"
+    );
+}
+
+#[test]
+fn the_readme_keeps_the_shell_binding_as_a_fallback_with_its_reason() {
+    // The shell form still works and some people will want it, but its absolute-path
+    // requirement is not arbitrary: a type = "shell" process is handed no
+    // HERDR_PLUGIN_ROOT to resolve a relative path against. Documenting the rule
+    // without the reason invites somebody to "simplify" it back to a relative path.
+    let readme = read("README.md");
+    assert!(readme.contains("type = \"shell\""));
+    assert!(
+        readme.contains("HERDR_PLUGIN_ROOT"),
+        "the README must say why the shell form needs an absolute path"
     );
 }
 
@@ -125,6 +190,85 @@ fn the_plugin_id_is_unchanged() {
     );
 }
 
+#[test]
+fn the_manifest_declares_a_build_step_that_runs_the_build_script() {
+    // [[build]] runs once during `herdr plugin install owner/repo`, before Herdr
+    // registers the plugin. Without it, somebody installing from GitHub has their
+    // FIRST worktree creation stall for a minute inside an event hook while cargo
+    // compiles, with only a toast to explain the pause.
+    //
+    // It does NOT run on `plugin link` and does NOT run on update, both verified;
+    // see docs/design.md. That is why bin/agent-layout still builds on demand, and
+    // why this test does not license removing it.
+    let parsed = manifest();
+    let build = parsed["build"]
+        .as_array()
+        .expect("[[build]] must be an array");
+    assert_eq!(build.len(), 1, "one build step, not several");
+    let command: Vec<String> = build[0]["command"]
+        .as_array()
+        .expect("a build step needs a command")
+        .iter()
+        .map(|c| c.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(command, vec!["sh", "bin/build"]);
+}
+
+#[test]
+fn the_build_script_exists_and_is_the_only_place_cargo_is_searched_for() {
+    // The manifest's build step and the shim share one implementation. Two copies of
+    // the cargo search would drift, and the rustup-directory fix would land in one.
+    let build = read("bin/build");
+    assert!(build.contains("/opt/homebrew/opt/rustup/bin/cargo"));
+    assert!(
+        build.contains("CARGO_DIR"),
+        "the rustup PATH fix must live here"
+    );
+    let shim = read("bin/agent-layout");
+    assert!(
+        shim.contains("bin/build"),
+        "the shim must delegate to bin/build"
+    );
+    assert!(
+        !shim.contains("rustup/bin/cargo"),
+        "the cargo search must not be duplicated into the shim"
+    );
+}
+
+#[test]
+fn the_manifest_declares_the_confirmation_popup() {
+    // plugin.pane.open names an entrypoint from [[panes]], so a missing or renamed
+    // entry means the confirmation never opens — and an unaskable question answers
+    // no, which would silently stop rebuilds from ever closing an agent pane.
+    let parsed = manifest();
+    let panes = parsed["panes"]
+        .as_array()
+        .expect("[[panes]] must be an array");
+    assert_eq!(panes.len(), 1, "one popup, not several");
+    let pane = &panes[0];
+    assert_eq!(pane["id"].as_str(), Some("confirm"));
+    assert_eq!(pane["placement"].as_str(), Some("popup"));
+    // Herdr accepts width and height only when placement is popup.
+    assert!(pane.get("width").is_some(), "a popup needs a width");
+    assert!(pane.get("height").is_some(), "a popup needs a height");
+    let command: Vec<String> = pane["command"]
+        .as_array()
+        .expect("the popup needs a command")
+        .iter()
+        .map(|c| c.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(command, vec!["sh", "bin/agent-layout", "--confirm"]);
+}
+
+#[test]
+fn the_popup_entrypoint_the_code_opens_is_the_one_the_manifest_declares() {
+    let declared = manifest()["panes"].as_array().unwrap()[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(agent_layout::confirm::PANE_ENTRYPOINT, declared);
+}
+
 // ---------------------------------------------------------------------------
 // The shim and the hook.
 // ---------------------------------------------------------------------------
@@ -142,25 +286,28 @@ fn the_shim_is_executable() {
 }
 
 #[test]
-fn the_shim_does_not_assume_cargo_is_on_the_path() {
+fn the_build_does_not_assume_cargo_is_on_the_path() {
     // Herdr's server runs under launchd with PATH=/usr/bin:/bin:/usr/sbin:/sbin,
-    // and cargo is not on it. A shim that only ran `cargo` would work in a
+    // and cargo is not on it. A build that only ran `cargo` would work in a
     // developer's shell and fail on every real event.
-    let shim = read("bin/agent-layout");
+    let build = read("bin/build");
     assert!(
-        shim.contains("/opt/homebrew/opt/rustup/bin/cargo"),
-        "the shim must search absolute cargo locations"
+        build.contains("/opt/homebrew/opt/rustup/bin/cargo"),
+        "the build must search absolute cargo locations"
     );
     assert!(
-        shim.contains(".cargo/bin/cargo"),
-        "the shim must search the rustup default location"
+        build.contains(".cargo/bin/cargo"),
+        "the build must search the rustup default location"
     );
 }
 
 #[test]
-fn the_shim_reports_a_missing_toolchain_rather_than_failing_silently() {
-    let shim = read("bin/agent-layout");
-    assert!(shim.contains("cargo not found"), "{}", shim);
+fn a_missing_toolchain_is_reported_rather_than_failing_silently() {
+    // The README now states cargo as a requirement, so the message that fires when
+    // it is absent has to name it and say what to do.
+    let build = read("bin/build");
+    assert!(build.contains("cargo not found"), "{}", build);
+    assert!(build.contains("cargo build --release"), "{}", build);
 }
 
 #[test]
@@ -181,11 +328,14 @@ fn the_shim_puts_cargos_own_directory_on_the_path_it_builds_with() {
     std::fs::write(plugin_root.join("Cargo.toml"), "").unwrap();
     std::fs::write(plugin_root.join("Cargo.lock"), "").unwrap();
     std::fs::write(plugin_root.join("src/main.rs"), "").unwrap();
+    std::fs::create_dir_all(plugin_root.join("bin")).unwrap();
     std::fs::copy(
         root().join("bin/agent-layout"),
         plugin_root.join("agent-layout"),
     )
     .unwrap();
+    // The shim delegates the build, so the real build script has to be there too.
+    std::fs::copy(root().join("bin/build"), plugin_root.join("bin/build")).unwrap();
 
     let recorded = dir.join("seen-path");
     let fake_cargo = toolchain.join("cargo");

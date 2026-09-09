@@ -33,34 +33,55 @@ git clone git@github.com:mike-bronner/herdr-plugin-agentic-panes-layout.git
 herdr plugin link /absolute/path/to/herdr-plugin-agentic-panes-layout
 ```
 
-Requires Herdr 0.8.2 or newer. Every socket method the plugin uses exists at
-protocol 20, which is 0.8.2.
+Requires Herdr 0.9.0 or newer, matching the floor
+[`mikebronner.project-finder`](https://github.com/mike-bronner/herdr-plugin-project-finder)
+declares. Every socket method this plugin uses in fact exists at protocol 20, which
+is 0.8.2, so the floor is about keeping the two plugins consistent rather than about
+a feature.
 
-### It builds itself on first use
+### Requirements
 
-The plugin is a Rust binary. `bin/agent-layout` is a small `sh` shim that builds
-it the first time it is needed and then execs it, and **rebuilds whenever the
-sources are newer than the binary**.
+**A Rust toolchain, 1.74 or newer**, with `cargo` on the machine. The plugin is a
+Rust binary and is compiled from source; Herdr installs no toolchains, so this one
+is yours to have. Nothing else is needed at runtime.
 
-That last part is the point. Herdr does have a `[[build]]` manifest entry that
-runs once at link time, and this plugin deliberately does not use it: a plugin
-linked from a working copy you are still editing would keep running a stale
-binary until you remembered to relink. See
-[`docs/design.md`](docs/design.md) for the trade-off.
+```sh
+# macOS, via Homebrew
+brew install rustup && rustup-init
+```
 
-**Build it once yourself to avoid a slow first event:**
+`git` is used to identify a workspace's repository, at `/usr/bin/git`, which macOS
+and every Linux this targets already have.
+
+### How the binary gets built
+
+Two mechanisms, because each covers what the other cannot.
+
+**Installing from GitHub** runs the manifest's `[[build]]` step: `cargo build
+--release`, once, during `herdr plugin install`, after the confirmation prompt and
+before Herdr registers the plugin. The compile happens where you are already
+looking, and Herdr reports a failure.
+
+**Everything else** is covered by `bin/agent-layout`, a small `sh` shim that
+builds the binary when it is missing or when the sources are newer, then execs it.
+That covers a linked working copy and a plugin update, because **`[[build]]` runs
+on neither**. It does not run on `herdr plugin link` and it does not run on update
+— verified rather than assumed, and the evidence is in
+[`docs/design.md`](docs/design.md).
+
+If you linked a working copy, **build once yourself** so your first worktree
+creation is not waiting on a compile:
 
 ```sh
 cd /path/to/herdr-plugin-agentic-panes-layout
 cargo build --release
 ```
 
-You need a Rust toolchain (1.74 or newer) to install from source; you do not need
-one afterwards. The shim does **not** assume `cargo` is on `PATH`, because Herdr's
-server runs under launchd with `PATH=/usr/bin:/bin:/usr/sbin:/sbin`. It searches
-`CARGO`, `$CARGO_HOME/bin`, `~/.cargo/bin`, and the Homebrew rustup prefixes. If
-it cannot find cargo and cannot find a built binary, it says so rather than going
-quiet.
+The shim does **not** assume `cargo` is on `PATH`, because Herdr's server runs
+under launchd with `PATH=/usr/bin:/bin:/usr/sbin:/sbin`. It searches `CARGO`,
+`$CARGO_HOME/bin`, `~/.cargo/bin`, and the Homebrew rustup prefixes, and puts
+cargo's own directory on `PATH` for the build so `rustc` resolves. If it can find
+neither cargo nor a built binary, it says so rather than going quiet.
 
 ## What it does
 
@@ -86,11 +107,37 @@ Requests go straight down `HERDR_SOCKET_PATH` as newline-delimited JSON, one
 connection per request. No `herdr` subprocesses. Errors come back as a structured
 code rather than as text to be pattern-matched out of stderr.
 
-### It is safe to run again
+### Automatic runs are safe to repeat; explicit ones rebuild
 
-The re-run guard is **tab-name based**: a tab whose name already exists in the
-workspace is skipped rather than rebuilt. So a second run is a no-op, and a run
-that died halfway is finished by the next one.
+When the `worktree.created` hook fires, the re-run guard is **tab-name based**: a
+tab whose name already exists in the workspace is skipped rather than rebuilt. So a
+second event is a no-op, and a run that died halfway is finished by the next one.
+
+**Asking for the layout yourself rebuilds instead**, whether through the action, the
+keybinding or the script. Asking explicitly is a statement of intent, so it
+re-applies the configured layout to a tab that is already there rather than skipping
+it. The hook is the one that opts into the guard, so nothing you invoke by hand needs
+a flag to get the rebuild.
+
+A rebuild closes the tab's other panes. If one of them is **running an agent**, you
+are asked first, in a popup, and it takes **one keypress**:
+
+| Key | What happens |
+| --- | --- |
+| `y` | Closes the agent's pane and rebuilds the tab clean. |
+| `n` | Keeps the agent running and rebuilds the layout *around* it, relabelled as the layout's first pane. No second agent is started in it, and no `command` is typed into it. |
+| `esc` | **Changes nothing at all.** |
+
+`esc` exists so a misfire is free. Without it the cheapest answer available still
+rearranges every other pane in the tab, so an accidental keypress would cost you a
+rearranged workspace.
+
+**A popup you close, ignore, or that cannot be opened means `esc`**, not `n`. Those
+are the same class of event as a misfire, so they cost nothing either, and the run
+says which one happened rather than going quiet. An agent mid-turn holds work that
+cannot be recovered, so silence never counts as consent.
+
+A rebuild that touches no agent pane asks nothing at all and simply proceeds.
 
 The first tab is the exception, because it is not created — it takes over the
 workspace's existing tab by being renamed. So it is skipped when a tab of its name
@@ -110,11 +157,42 @@ nobody.
 **A bad config file is never fatal.** It falls back to the built-in layout and
 says so. See the failure table in [`docs/configuration.md`](docs/configuration.md).
 
-## Keybinding
+## Applying the layout yourself
 
-`bin/agent-layout` can also be run on its own, against whichever workspace is
-focused. That is useful for a plain repo or a worktree you opened by hand. Bind it
+Useful for a plain repo, or a worktree you opened by hand, or after you have
+rearranged a tab and want the layout back.
+
+The plugin declares an **action**, `mikebronner.agentic-panes-layout.apply`, so there
+are three ways to reach it and none of them needs a path:
+
+```sh
+herdr plugin action invoke mikebronner.agentic-panes-layout.apply
+```
+
+It also appears in Herdr's action menu. And this is the **recommended keybinding**,
 in `~/.config/herdr/config.toml`:
+
+```toml
+[[keys.command]]
+key = "prefix+ctrl+l"
+type = "plugin_action"
+command = "mikebronner.agentic-panes-layout.apply"
+```
+
+Three reasons to prefer this over the shell form below, and the third is the real
+one. There is no absolute path to get wrong. It keeps working when you move the
+checkout. And a `type = "shell"` process is handed `HERDR_ACTIVE_*`,
+`HERDR_BIN_PATH`, `HERDR_SOCKET_PATH` and `HERDR_SESSION` but **no
+`HERDR_PLUGIN_ROOT`** — which is the entire reason the shell form needs an absolute
+path. An action is given plugin context, so that requirement disappears.
+
+Note that a plugin manifest **cannot** declare a keybinding for you: there is no
+`keys` field in a plugin manifest at any version, and a `[[keys.command]]` block
+placed in one is silently ignored. The binding above is yours to add once.
+
+### The shell form still works
+
+For invoking the script directly, or if you would rather not use an action:
 
 ```toml
 [[keys.command]]
@@ -123,9 +201,10 @@ type = "shell"
 command = "/absolute/path/to/herdr-plugin-agentic-panes-layout/bin/agent-layout"
 ```
 
-The absolute path is required. A `[[keys.command]]` process is handed
-`HERDR_ACTIVE_*`, `HERDR_BIN_PATH`, `HERDR_SOCKET_PATH` and `HERDR_SESSION`, and
-no `HERDR_PLUGIN_ROOT` to resolve a relative path against.
+**The absolute path is required here**, for the `HERDR_PLUGIN_ROOT` reason above.
+If you are switching from this form to the action, edit that one entry in
+`~/.config/herdr/config.toml`; nothing else changes, and both forms do the same
+thing.
 
 ## Configure
 
@@ -204,8 +283,13 @@ that behaviour is fixed.
 bin/agent-layout [--from-event] [--workspace <id>] [--agent-name <name>]
 ```
 
-`--from-event` reads `HERDR_PLUGIN_EVENT_JSON` and does nothing unless its
-workspace is the focused one. The event hook passes it and nothing else does.
+`--from-event` marks the automatic path. It reads `HERDR_PLUGIN_EVENT_JSON` and
+does nothing unless that workspace is the focused one, and it opts into the
+tab-name guard so an existing tab is skipped. The event hook passes it and nothing
+else does.
+
+`--confirm` is how the plugin runs *itself* inside the confirmation popup. It is
+declared in the manifest's `[[panes]]` block and is not for you to type.
 
 `--workspace <id>` lays out the workspace with that id rather than the focused
 one. "Which workspace is focused?" is the right question for the hook and the
