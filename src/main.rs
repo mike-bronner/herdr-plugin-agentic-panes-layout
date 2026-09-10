@@ -1,7 +1,5 @@
-use std::process::Command;
-
 use agent_layout::api::{self, Client};
-use agent_layout::{config, confirm, layout};
+use agent_layout::{check, config, confirm, issues, layout, project};
 
 fn main() {
     let code = match run() {
@@ -24,6 +22,8 @@ struct Args {
     from_event: bool,
     confirm: bool,
     rebuild: bool,
+    check: bool,
+    issues: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -33,6 +33,8 @@ fn parse_args() -> Result<Args, String> {
         from_event: false,
         confirm: false,
         rebuild: false,
+        check: false,
+        issues: false,
     };
     let mut raw = std::env::args().skip(1);
     while let Some(flag) = raw.next() {
@@ -54,6 +56,18 @@ fn parse_args() -> Result<Args, String> {
                     return Err("--rebuild given more than once".to_string());
                 }
                 args.rebuild = true;
+            }
+            "--check" => {
+                if args.check {
+                    return Err("--check given more than once".to_string());
+                }
+                args.check = true;
+            }
+            "--issues" => {
+                if args.issues {
+                    return Err("--issues given more than once".to_string());
+                }
+                args.issues = true;
             }
             "--workspace" => {
                 if args.workspace.is_some() {
@@ -104,6 +118,19 @@ fn run() -> Result<(), Exit> {
     // to the socket, so it returns before anything else is resolved.
     if args.confirm {
         return confirm::run_popup().map_err(Exit);
+    }
+
+    // The issues popup is this same binary too, and like the confirmation it talks to a
+    // terminal and a file rather than to the socket.
+    if args.issues {
+        return issues::run_popup().map_err(Exit);
+    }
+
+    // Before the socket, deliberately. A real run resolves the workspace first, so it
+    // cannot reach config parsing without a server; the whole point of --check is that
+    // it can, and that it touches nothing while doing it.
+    if args.check {
+        std::process::exit(check::run(&check::current_dir()));
     }
 
     if args.from_event && !event_workspace_is_focused() {
@@ -158,14 +185,38 @@ fn run() -> Result<(), Exit> {
         })?;
 
     let loaded = config::load();
-    let candidates = project_candidates(&target, &cwd);
+    let candidates = project::candidates(
+        target.checkout_path.as_deref(),
+        target.repo_root.as_deref(),
+        &cwd,
+    );
     let chosen = loaded.choose(&candidates);
 
-    for note in &loaded.diagnostics {
-        report(Some(&client), note);
-    }
+    // Every diagnostic reaches stderr, which is what `herdr plugin log list` keeps and
+    // the only record that survives when nothing renders.
+    //
+    // Only ONE toast, though, and not one per diagnostic. Measured on 0.9.0: a second
+    // toast answers Busy, there is a rate limit, and under Mike's own
+    // `ui.toast.delivery = "system"` every one of them answers shown=false anyway. The
+    // old loop could therefore never have shown more than its first item. The popup
+    // below carries the detail; this line is a nudge for somebody on delivery = "herdr".
+    let mut problems: Vec<String> = loaded.diagnostics.clone();
     if let Some(note) = &chosen.diagnostic {
-        report(Some(&client), &format!("{}: {}", target.label, note));
+        problems.push(format!("{}: {}", target.label, note));
+    }
+    for note in &problems {
+        eprintln!("agent-layout: {}", note);
+    }
+    if !problems.is_empty() {
+        api::notify(
+            &client,
+            &format!(
+                "{}: {} problem{} in your config; see the popup",
+                target.label,
+                problems.len(),
+                if problems.len() == 1 { "" } else { "s" }
+            ),
+        );
     }
 
     let plan = layout::Target {
@@ -192,6 +243,18 @@ fn run() -> Result<(), Exit> {
     report(
         Some(&client),
         &summary(&target.label, &loaded, &chosen, &outcome),
+    );
+
+    // AFTER the layout, deliberately, and without waiting for it. A config problem is a
+    // cosmetic warning, and gating pane creation on a dialog would turn it into a stall.
+    // By here every pane exists and the agent has started.
+    issues::show(
+        &client,
+        &match &loaded.source {
+            Some(path) => path.display().to_string(),
+            None => config::config_path().display().to_string(),
+        },
+        &problems,
     );
     Ok(())
 }
@@ -231,50 +294,6 @@ fn summary(
         origin,
         parts.join("; ")
     )
-}
-
-fn project_candidates(workspace: &api::Workspace, cwd: &str) -> Vec<String> {
-    let mut candidates = Vec::new();
-    for path in [&workspace.checkout_path, &workspace.repo_root]
-        .into_iter()
-        .flatten()
-    {
-        candidates.push(path.clone());
-    }
-    if let Some(toplevel) = git(cwd, &["rev-parse", "--show-toplevel"]) {
-        candidates.push(toplevel);
-    }
-    if let Some(common) = git(
-        cwd,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    ) {
-        let root = common
-            .strip_suffix("/.git")
-            .map(|s| s.to_string())
-            .unwrap_or(common);
-        candidates.push(root);
-    }
-    candidates.sort();
-    candidates.dedup();
-    candidates
-}
-
-fn git(cwd: &str, args: &[&str]) -> Option<String> {
-    let output = Command::new("/usr/bin/git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
 }
 
 fn report(client: Option<&Client>, message: &str) {

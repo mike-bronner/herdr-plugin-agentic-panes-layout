@@ -159,7 +159,15 @@ struct Channel {
 
 impl Channel {
     fn new() -> std::io::Result<Channel> {
-        let dir = std::env::temp_dir().join(format!("agent-layout-ask-{}", std::process::id()));
+        // Unique per call, not merely per process. A layout with agents in more than one
+        // tab asks more than once, and the popup deletes the file and directory it was
+        // given on its way out. Keyed on the pid alone every call shared one path, so a
+        // lingering first popup could delete the second question's answer file, and the
+        // second would then time out having been answered.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("agent-layout-ask-{}-{}", std::process::id(), n));
         std::fs::create_dir_all(&dir)?;
         Ok(Channel {
             answer: dir.join("answer"),

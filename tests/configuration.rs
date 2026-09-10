@@ -138,9 +138,12 @@ fn a_later_pane_with_no_split_is_refused_with_a_message_naming_it() {
     let stub = Stub::start(Script::default());
     let run = run(&stub, &[], Some(root.as_path()));
     assert_eq!(run.status, 0, "{}", run.stderr);
+    // The message has to carry the FIX, not only the rule. Somebody who has never read
+    // docs/configuration.md must be able to act on it.
+    assert!(run.says("pane 2 has no split"), "{}", run.stderr);
     assert!(
-        run.says("pane 2 needs a split direction, right or down"),
-        "{}",
+        run.says("add split = \"right\" or split = \"down\""),
+        "the message must say what to add: {}",
         run.stderr
     );
 }
@@ -158,10 +161,18 @@ fn a_first_pane_carrying_a_split_is_refused() {
     let stub = Stub::start(Script::default());
     let run = run(&stub, &[], Some(root.as_path()));
     assert!(
-        run.says("the first pane is the tab's own pane and cannot carry a split"),
+        run.says("is the tab's own pane, so it cannot carry a split"),
         "{}",
         run.stderr
     );
+    // The fix is two pane blocks, which is not something a reader would guess. This is
+    // the exact mistake Mike made in his own config after v0.3.0 shipped.
+    assert!(
+        run.says("write TWO pane blocks"),
+        "the message must name the fix: {}",
+        run.stderr
+    );
+    assert!(run.says("empty first one"), "{}", run.stderr);
 }
 
 #[test]
@@ -459,7 +470,13 @@ fn the_built_in_layout_is_the_v0_2_0_geometry_without_the_labels() {
 fn the_built_in_config_passes_its_own_validation() {
     // A default that could not be written as a config file would be a default
     // nobody could copy into one.
-    config::validate(&config::built_in_config()).expect("the built-in config must be valid");
+    let found = config::validate(&config::built_in_config());
+    assert!(
+        found.problems.is_empty(),
+        "the built-in config must be valid: {:?}",
+        found.problems
+    );
+    assert!(found.unusable.is_empty());
 }
 
 #[test]

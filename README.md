@@ -62,12 +62,20 @@ Two mechanisms, because each covers what the other cannot.
 before Herdr registers the plugin. The compile happens where you are already
 looking, and Herdr reports a failure.
 
+**Every Herdr server start** runs the manifest's `[[startup]]` step, which is the same
+build. So a linked checkout is refreshed whenever you restart Herdr, without waiting
+for something to invoke the plugin. Measured as firing for a linked plugin, not
+inferred.
+
 **Everything else** is covered by `bin/agent-layout`, a small `sh` shim that
 builds the binary when it is missing or when the sources are newer, then execs it.
-That covers a linked working copy and a plugin update, because **`[[build]]` runs
-on neither**. It does not run on `herdr plugin link` and it does not run on update
+That is what catches a source edit while a server is already running, which no
+manifest hook fires for. `[[build]]` runs on neither `herdr plugin link` nor update
 — verified rather than assumed, and the evidence is in
 [`docs/design.md`](docs/design.md).
+
+All three point at the same `bin/build`, so there is one definition of how the binary
+gets built. Two builds racing is safe: cargo serialises them, measured.
 
 If you linked a working copy, **build once yourself** so your first worktree
 creation is not waiting on a compile:
@@ -257,6 +265,39 @@ agent = "claude"
 `path` is matched against both the workspace's checkout path and its repo root, so
 naming a repository covers every worktree of it. Rules are evaluated in file
 order and the first match wins.
+
+### A broken config is not silent
+
+Any problem in `agent-layout.toml` opens a **popup pane listing every issue**, on the
+automatic worktree path as well as when you invoke the layout yourself. Press any key
+to dismiss it. It opens *after* the panes are built and nothing waits for it, so a
+warning never delays your workspace.
+
+This is a pane rather than a toast for a measured reason: with
+`ui.toast.delivery = "system"`, `notification.show` answers `shown: false` and the
+message is dropped before rendering, while a plugin pane opens regardless. Herdr also
+gives plugin toasts no severity, allows only one at a time, and rate-limits them.
+[`docs/configuration.md`](docs/configuration.md) has the measurements.
+
+Every diagnostic also goes to stderr, which is what
+`herdr plugin log list --plugin mikebronner.agentic-panes-layout` keeps.
+
+### Check a config before you rely on it
+
+```sh
+bin/agent-layout --check
+```
+
+It prints the problems it found, the layout that would be chosen and why, and the tabs
+and panes it would build. It exits non-zero when the file would not be used as written.
+
+**It touches nothing** — no socket, no workspace, no pane. That matters because a bad
+config is otherwise invisible: a file that fails to parse falls back to the built-in
+layout, which still produces a plausible workspace. The only clues are a diagnostic
+nobody was watching for and a layout that is quietly not the one you wrote.
+
+Worth knowing: **one broken layout discards the whole file**, including layouts that
+are correct. `--check` says so when it happens.
 
 **The full reference is [`docs/configuration.md`](docs/configuration.md):** the
 whole schema, how the config root is derived, what each failure does, and why the

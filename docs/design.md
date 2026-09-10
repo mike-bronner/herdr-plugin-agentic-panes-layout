@@ -70,15 +70,62 @@ linked with `herdr plugin link`:
 
 So `[[build]]` is real and understood at 0.9.0, and `link` does not trigger it.
 
-It does **not** run on link, and it does **not** run on update. That is the whole
-reason the shim exists rather than being a fallback for a missing feature:
+It does **not** run on link, and it does **not** run on update.
+
+### `[[startup]]`, the second mechanism
+
+`[[startup]]` runs once per enabled plugin at every server start, and again on live
+handoff when a new server takes over. It is asynchronous and non-blocking, Herdr
+records it in the normal plugin command log, and a failure does not stop the server.
+It is one-shot initialisation rather than a supervised daemon, so the command does its
+work and exits — which `bin/build` does.
+
+**That it fires for a *linked* plugin was measured twice, independently, and was an
+inference until then.** The distinction matters. Herdr's documentation says "each
+enabled plugin" and draws no line between linked and installed, and all three of these
+plugins added a `[[startup]]` entry on that reading. Taking capability from silence is
+the mistake this file has already recorded twice, so the reading being correct is luck
+until somebody checks.
+
+- Measured here, 2026-09-10 on 0.9.0: a throwaway plugin declaring a startup command
+  that appends to a marker was linked into an isolated server, the server restarted,
+  and the marker was written **exactly once**, with `succeeded exit 0` in
+  `herdr plugin log list`. Linking alone wrote nothing.
+- Measured independently by the `herdr-plugin-recent-spaces` session on the same
+  version, by a different route and while probing something else: same manifest shape,
+  `plugin link` never `install`, `plugin list` reporting source kind `local`, stop,
+  start, marker present holding the command's own output.
+
+**What that proves, and what it does not.** It proves firing on a **server restart**
+with the plugin already linked. Linking only makes the entry eligible; it is not itself
+the trigger. The same session separately measured that a startup command does **not**
+run on `plugin link`, on `plugin enable`, or on a disable-then-enable cycle. Both
+measurements are 0.9.0 on macOS, single session.
+
+### Three mechanisms, and what each covers
 
 | Path | Covered by |
 | --- | --- |
 | `herdr plugin install owner/repo` | `[[build]]` |
-| `herdr plugin link <path>`, a working copy | **the shim only** |
-| A source edit in a linked checkout | **the shim only** |
+| Every server start, and live handoff | `[[startup]]` |
+| `herdr plugin link <path>`, before the next server start | **the shim only** |
+| A source edit while a server is already running | **the shim only** |
 | A plugin update | **the shim only** |
+
+The last two are why the shim stays. Editing source in a linked checkout is the normal
+development loop here, and no manifest hook fires for it.
+
+All three point at `bin/build`, so there is **one** definition of how this binary is
+built. Duplicating the cargo discovery into a second place is the thing to avoid; three
+copies of that logic already exist across these plugins.
+
+**Concurrent builds are safe, measured rather than assumed.** Startup is asynchronous,
+so a `worktree.created` can fire while the startup build is still running and the shim
+may decide to build too. Two `bin/build` runs were started together against a dirty
+tree: **both exited 0**, both logged `Blocking waiting for file lock`, and the binary
+was usable afterwards. Cargo serialises them, so the cost is a wait rather than a
+corrupt artifact. The uncovered case is a build that fails at startup and is not
+retried until something invokes the plugin — and the shim is exactly what handles that.
 
 Herdr installs no toolchains and reports a build failure rather than resolving
 it, and its documentation tells authors to document the tools they need. Hence the

@@ -215,6 +215,75 @@ fn the_manifest_declares_a_build_step_that_runs_the_build_script() {
 }
 
 #[test]
+fn the_manifest_declares_a_startup_step_that_runs_the_same_build_script() {
+    // [[startup]] runs once per enabled plugin at every server start, and again on live
+    // handoff.
+    //
+    // That it fires for a LINKED plugin is the case that matters here, and the
+    // documentation only implies it by saying "each enabled plugin" without drawing a
+    // line. It was measured twice on 0.9.0 rather than left as that inference: once
+    // here, and once independently by the recent-spaces session. Both saw the marker
+    // written exactly once after a server restart, never on the link itself.
+    //
+    // The trigger is the server restart. Linking only makes the entry eligible, and a
+    // startup command does not run on link, on enable, or on a disable-then-enable
+    // cycle.
+    //
+    // It points at bin/build, the same script [[build]] uses, so there is one definition
+    // of how this binary is built rather than a second copy of the cargo discovery.
+    let parsed = manifest();
+    let startup = parsed["startup"]
+        .as_array()
+        .expect("[[startup]] must be an array");
+    assert_eq!(startup.len(), 1, "one startup step, not several");
+    let command: Vec<String> = startup[0]["command"]
+        .as_array()
+        .expect("a startup step needs a command")
+        .iter()
+        .map(|c| c.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(command, vec!["sh", "bin/build"]);
+}
+
+#[test]
+fn the_build_and_startup_steps_share_one_definition() {
+    // Three copies of the cargo discovery logic across these plugins is already a
+    // concern; a fourth inside this repository would be worse. If these two ever differ,
+    // one of them is a second definition of how to build.
+    let parsed = manifest();
+    assert_eq!(
+        parsed["build"].as_array().unwrap()[0]["command"],
+        parsed["startup"].as_array().unwrap()[0]["command"]
+    );
+}
+
+#[test]
+fn the_manifest_declares_exactly_the_sections_that_were_argued_for() {
+    // The manifest's shape, pinned. Every section here was a decision: [[build]] for a
+    // GitHub install, [[startup]] for a server start, [[actions]] for the keybinding,
+    // [[panes]] for the two popups, [[events]] for the hook. A section appearing without
+    // an argument behind it is what this catches.
+    let parsed = manifest();
+    let mut sections: Vec<&str> = parsed
+        .keys()
+        .filter(|k| parsed[*k].is_array())
+        .map(|k| k.as_str())
+        .collect();
+    sections.sort();
+    assert_eq!(
+        sections,
+        vec![
+            "actions",
+            "build",
+            "events",
+            "panes",
+            "platforms",
+            "startup"
+        ]
+    );
+}
+
+#[test]
 fn the_build_script_exists_and_is_the_only_place_cargo_is_searched_for() {
     // The manifest's build step and the shim share one implementation. Two copies of
     // the cargo search would drift, and the rustup-directory fix would land in one.
@@ -236,37 +305,72 @@ fn the_build_script_exists_and_is_the_only_place_cargo_is_searched_for() {
 }
 
 #[test]
-fn the_manifest_declares_the_confirmation_popup() {
+fn the_manifest_declares_exactly_the_two_popups_that_exist() {
     // plugin.pane.open names an entrypoint from [[panes]], so a missing or renamed
-    // entry means the confirmation never opens — and an unaskable question answers
-    // no, which would silently stop rebuilds from ever closing an agent pane.
+    // entry means that popup never opens. For the confirmation that means an unaskable
+    // question, which answers "change nothing" and would silently stop rebuilds from
+    // ever closing an agent pane. For the issues popup it means a broken config goes
+    // back to being invisible, which is the thing it was added to prevent.
+    //
+    // Pinned to the exact list rather than a membership check, for the same reason the
+    // event list is: the value is catching an entry nobody argued for.
     let parsed = manifest();
     let panes = parsed["panes"]
         .as_array()
         .expect("[[panes]] must be an array");
-    assert_eq!(panes.len(), 1, "one popup, not several");
-    let pane = &panes[0];
-    assert_eq!(pane["id"].as_str(), Some("confirm"));
-    assert_eq!(pane["placement"].as_str(), Some("popup"));
-    // Herdr accepts width and height only when placement is popup.
-    assert!(pane.get("width").is_some(), "a popup needs a width");
-    assert!(pane.get("height").is_some(), "a popup needs a height");
-    let command: Vec<String> = pane["command"]
-        .as_array()
-        .expect("the popup needs a command")
-        .iter()
-        .map(|c| c.as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(command, vec!["sh", "bin/agent-layout", "--confirm"]);
+    let ids: Vec<&str> = panes.iter().map(|p| p["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec!["confirm", "issues"]);
+
+    for pane in panes {
+        assert_eq!(
+            pane["placement"].as_str(),
+            Some("popup"),
+            "{:?}",
+            pane["id"]
+        );
+        // Herdr accepts width and height only when placement is popup.
+        assert!(pane.get("width").is_some(), "a popup needs a width");
+        assert!(pane.get("height").is_some(), "a popup needs a height");
+        assert!(
+            pane.get("title").is_some(),
+            "Herdr draws the title on the frame, so every popup has one"
+        );
+    }
+
+    let command = |i: usize| -> Vec<String> {
+        panes[i]["command"]
+            .as_array()
+            .expect("the popup needs a command")
+            .iter()
+            .map(|c| c.as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(command(0), vec!["sh", "bin/agent-layout", "--confirm"]);
+    assert_eq!(command(1), vec!["sh", "bin/agent-layout", "--issues"]);
 }
 
 #[test]
-fn the_popup_entrypoint_the_code_opens_is_the_one_the_manifest_declares() {
-    let declared = manifest()["panes"].as_array().unwrap()[0]["id"]
-        .as_str()
+fn every_popup_entrypoint_the_code_opens_is_one_the_manifest_declares() {
+    // A drift between a constant and the manifest opens nothing, and both popups fail
+    // quietly when that happens.
+    let parsed = manifest();
+    let declared: Vec<&str> = parsed["panes"]
+        .as_array()
         .unwrap()
-        .to_string();
-    assert_eq!(agent_layout::confirm::PANE_ENTRYPOINT, declared);
+        .iter()
+        .map(|p| p["id"].as_str().unwrap())
+        .collect();
+    for used in [
+        agent_layout::confirm::PANE_ENTRYPOINT,
+        agent_layout::issues::PANE_ENTRYPOINT,
+    ] {
+        assert!(
+            declared.contains(&used),
+            "the code opens \"{}\" but the manifest declares {:?}",
+            used,
+            declared
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -387,9 +491,14 @@ struct TempDir {
 
 impl TempDir {
     fn new() -> TempDir {
+        // Unique per call. Keyed on the pid alone, two of these in one process would
+        // share a directory and the first `new` would delete the second's contents.
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let path = PathBuf::from(format!(
-            "/private/tmp/agent-layout-shim-{}",
-            std::process::id()
+            "/private/tmp/agent-layout-shim-{}-{}",
+            std::process::id(),
+            n
         ));
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).unwrap();

@@ -100,6 +100,28 @@ labels whether the user wanted them or not. Omitting the key now sends no
 empty string. The two are deliberately not interchangeable, and there is a test
 holding them apart.
 
+### Two panes means two pane blocks
+
+The commonest mistake, and the natural misreading of the schema. To get two panes side
+by side, write **two** `[[...tabs.panes]]` blocks:
+
+```toml
+[[layouts.two.tabs]]
+name = "work"
+
+# The tab's own pane. It already exists, so this block can be empty.
+[[layouts.two.tabs.panes]]
+
+# The second pane, split out of the first.
+[[layouts.two.tabs.panes]]
+split = "right"
+ratio = 0.5
+```
+
+**One block carrying `split = "right"` is rejected**, because the first block is the
+tab's own pane and nothing splits it into existence. One block describes one pane, not
+one division.
+
 ### How splits are read
 
 Each pane after the first carries `split` and optionally `ratio`, meaning:
@@ -156,32 +178,149 @@ no prefix matching: `/repos` does not match `/repos/thing`, and `/repos/*` is
 taken literally. Neither was asked for, and a prefix rule would silently capture
 every sibling repository under a shared parent.
 
-Where the paths come from: `herdr workspace list` returns a `worktree` object
-carrying `checkout_path` and `repo_root`, but **only for spaces Herdr created
-through its worktree path**. A plain workspace on a git repo has no such object,
-and `is_linked_worktree: false` does not mean "not a worktree space". So the
-paths fall back to `git -C <pane cwd> rev-parse --show-toplevel` and
-`--git-common-dir`.
+**A plain directory works too.** A rule is matched against the workspace's **own
+directory** as well as its checkout path and repo root, so a home directory can have a
+layout:
+
+```toml
+[[projects]]
+path = "/Users/you"
+layout = "two-shells"
+```
+
+Note what this does **not** do: it matches that directory exactly, not everything under
+it. There is still no prefix matching.
+
+**When two rules both match, file order decides — not specificity.** Inside a
+repository the candidates include both the directory you are in and the repository
+root, so a rule naming a subdirectory and a rule naming the repository can both match at
+once. The earlier rule in the file wins, even if the later one looks more specific. Put
+narrower rules first.
+
+`--check` prints the candidate list, so you can see exactly what a rule has to match.
+
+Where the candidate paths come from, in order of how reliably they are there:
+
+- **The workspace's own working directory.** Always available, which is what makes a
+  plain directory matchable at all.
+- **`checkout_path` and `repo_root`**, from `herdr workspace list`'s `worktree` object.
+  Present **only for spaces Herdr created through its worktree path**. A plain
+  workspace on a git repo has no such object, and `is_linked_worktree: false` does not
+  mean "not a worktree space".
+- **`git -C <cwd> rev-parse --show-toplevel`** and `--git-common-dir`, which fill the
+  gap when that object is absent.
+
+## How problems reach you
+
+Three ways, deliberately, because the obvious one turned out not to work.
+
+**A popup pane, listing every problem.** Any diagnostic opens it, on the automatic
+`worktree.created` path as well as an explicit invocation. A broken config should never
+be invisible, and that outranks the cost of a popup you did not ask for. Any key
+dismisses it, since there is nothing to decide.
+
+It opens **after** the layout is applied, and nothing waits for it. A config problem is
+a warning, and gating pane creation on a dialog would turn it into a stall.
+
+**stderr, always.** Every diagnostic goes there whatever else renders, which is what
+`herdr plugin log list --plugin mikebronner.agentic-panes-layout` keeps. It is the
+record that survives.
+
+**One toast, at most.** A nudge for anyone running `ui.toast.delivery = "herdr"`; the
+popup carries the detail.
+
+### Why a toast was not enough
+
+Measured on Herdr 0.9.0, in one isolated server with `ui.toast.delivery = "system"`:
+
+- `notification.show` answered `{"shown": false, "reason": "no_foreground_client"}` for
+  every call.
+- `plugin.pane.open` in the same server started the pane's process.
+
+So config diagnostics sent as toasts were being dropped before they rendered. A pane is
+a different mechanism and does not consult the toast settings.
+
+Three further limits make a toast the wrong shape even where it does render. There is
+**no severity** — Herdr hardcodes every API-originated notification to one kind, so a
+plugin cannot make an error look like an error. **Only one toast is live at a time**,
+and the next answers `Busy`. And there is a **rate limit**. This plugin used to send one
+toast per diagnostic, so at best the first ever appeared.
+
+## Checking a file before you rely on it
+
+```sh
+bin/agent-layout --check
+```
+
+It prints the file it read, every problem it found, which layout would be chosen and
+why, and the tabs and panes that layout would build. It exits non-zero when the file
+exists and **would not be used as written**.
+
+**It touches nothing.** No socket is opened, no workspace is listed, no pane is made.
+It is safe to run against a config you already suspect, which is the point. Note that
+a real run resolves the workspace *before* it reads the config, so a real run cannot
+tell you anything about a config without a server; `--check` deliberately does not
+share that order.
+
+**Why this exists at all: a bad config is invisible in use.** A file that fails to
+parse falls back to the built-in layout, which still produces a plausible three-pane
+workspace. So the symptoms are a diagnostic nobody was watching for and a layout that
+is subtly not the one you wrote — a ratio of 0.6 instead of yours, and no pane labels.
+Before `--check`, finding out meant creating a worktree and studying the result.
+
+Two things in the output are worth knowing about:
+
+- **It names which pane a `ratio` sizes.** A line reading `pane 2 keeps 0.7` is the
+  check earning its keep, because the ratio is written on pane 3 and applies to pane 2.
+  A reader who had that backwards sees it here rather than in a mis-sized workspace.
+- **It distinguishes `not labelled` from `labelled with an empty string`.** Those are
+  different requests and only one of them sends a rename.
+
+`--check` matches `[[projects]]` rules against the directory you run it from. If that
+directory is not a git repository it says so, and only the top-level `default` can
+apply there.
 
 ## How a bad file fails
 
-Herdr's own config handling is matched deliberately, because this file sits in
-the same directory. Herdr uses `toml` with `serde_ignored`: an unknown key
-produces a diagnostic and the rest of the file still applies, while a syntax
-error discards the whole file and falls back to defaults. Nothing about config is
-ever fatal.
+**Nothing about config is ever fatal**, and how much is lost depends on *where* the
+problem is. There are three tiers.
 
-| What is wrong | What happens |
+**A file that will not parse is lost whole.** A TOML syntax error means there are no
+layouts to salvage, so the built-in layout applies. Herdr treats its own config the
+same way.
+
+**A layout with a problem is skipped on its own.** The file parsed, so every other
+layout is intact and keeps working. Only the broken one is dropped.
+
+**Anything smaller is a warning.** An unknown key is ignored and the rest of the block
+still applies.
+
+| What is wrong | What is lost |
 |---|---|
-| No file | The built-in layout applies. Silent — this is the normal fresh install. |
-| Unknown key or section | Reported. **The rest of the file still applies.** |
-| TOML syntax error | Reported. The whole file is discarded and the built-in layout applies. |
-| Unreadable file, for example bad permissions | Reported. Built-in layout. |
-| `default` names a layout nothing defines | Reported. Built-in layout. |
-| No `default` and no matching rule | Reported. Built-in layout. |
-| Invalid `split` direction | Reported as a parse failure. Built-in layout. |
-| A later pane with no `split` | Reported. Built-in layout. |
-| A first pane carrying a `split` | Reported. Built-in layout. |
+| No file | Nothing. The built-in layout applies, silently. This is the normal fresh install. |
+| Unknown key or section | **Just that key.** Reported, and where the key is real but in the wrong table, the message names its proper home. |
+| TOML syntax error | **The whole file.** Reported. Built-in layout. |
+| Unreadable file, for example bad permissions | **The whole file.** Reported. Built-in layout. |
+| Invalid `split` direction | **The whole file**, because it is a parse failure rather than a structural one. Reported. Built-in layout. |
+| A first pane carrying a `split` | **That layout only.** Reported, with the fix. |
+| A later pane with no `split` | **That layout only.** Reported, with the fix. |
+| A layout with no tabs | **That layout only.** Reported, with the fix. |
+| A tab with no name, or with no panes | **That layout only.** Reported, with the fix. |
+| A `[[projects]]` entry with an empty `path` | **That rule only.** Reported. It could never match anything anyway. |
+| `default` names a layout that does not exist | Reported. Built-in layout applies for this run. |
+| `default` names a layout that was skipped | Reported, naming which layout failed. Built-in layout applies for this run. |
+| No `default` and no matching rule | Reported. Built-in layout applies for this run. |
+
+**Every problem in the file is reported in one run**, not the first one only. Fixing
+three mistakes takes one `--check`, not three.
+
+**When the layout that would have been chosen is itself the broken one**, the built-in
+layout applies and the message names which layout was unusable. A workspace with no
+layout at all is worse than a workspace with the default, since the point of the plugin
+is that a new worktree arrives usable.
+
+Each message names **the fix**, not only the rule. Two of them are mistakes where the
+natural reading of the schema is the wrong one, so the rule alone is no help.
 
 **Nothing in this table exits non-zero.** A syntax error in a file the user owns
 must not leave a half-built workspace or a dead hook. Falling back to the

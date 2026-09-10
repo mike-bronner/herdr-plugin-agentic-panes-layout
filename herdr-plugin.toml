@@ -8,6 +8,9 @@ platforms = ["macos", "linux"]
 [[build]]
 command = ["sh", "bin/build"]
 
+[[startup]]
+command = ["sh", "bin/build"]
+
 [[actions]]
 id = "apply"
 title = "Apply agent layout"
@@ -21,6 +24,14 @@ placement = "popup"
 width = "60%"
 height = "30%"
 command = ["sh", "bin/agent-layout", "--confirm"]
+
+[[panes]]
+id = "issues"
+title = "Agent layout: config problems"
+placement = "popup"
+width = "80%"
+height = "60%"
+command = ["sh", "bin/agent-layout", "--issues"]
 
 [[events]]
 on = "worktree.created"
