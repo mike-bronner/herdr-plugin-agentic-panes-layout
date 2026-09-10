@@ -13,8 +13,9 @@
 //!
 //! Three things about `plugin.pane.open`, all measured on 0.9.0, 2026-09-09:
 //!
-//! 1. **It answers `{"type":"ok"}` and nothing else** — no pane id. So the popup
-//!    cannot be polled for by id and cannot be closed by id.
+//! 1. **A success answers `{"type":"ok"}` and carries no pane id.** It can fail —
+//!    `ui_busy` when a popup is already open — but it never hands back a handle, so
+//!    the popup cannot be polled for by id and cannot be closed by id.
 //! 2. **A plugin pane does not appear in `pane.list`.** So it cannot be found by id
 //!    afterwards either.
 //! 3. **The pane's command process does run**, and was observed running in a server
@@ -33,13 +34,26 @@
 //! **Two answers, and every failure is the second.**
 //!
 //! - `y` closes the pane running the agent and rebuilds the tab clean.
-//! - `esc` changes nothing at all.
+//! - `esc`, `Ctrl-C`, or a **click anywhere in the pane**, changes nothing at all.
 //!
-//! There was a third, `n`, which kept the agent and built the layout around it. It is
-//! gone because the engine cannot express it: `layout.apply` replaces a tab wholesale
-//! and `pane_id` on a leaf is output-only, so a running agent cannot be carried into a
-//! new tree. Mike dropped the requirement rather than the rewrite, on the grounds that
-//! new panes are being made anyway.
+//! **A click can only ever dismiss.** Measured on 0.9.0: Herdr forwards a click inside a
+//! plugin pane to that pane, as an SGR sequence rebased to pane-local coordinates, and
+//! does not forward one outside it. So the whole pane is the dismiss target, which is
+//! what "click to get out" has to mean in a dialog with nothing to aim at.
+//!
+//! There was a third answer, `n`, which kept the agent and built the layout around it.
+//! It is gone because the engine cannot express it: `layout.apply` replaces a tab
+//! wholesale and `pane_id` on a leaf is output-only, so a running agent cannot be
+//! carried into a new tree. Mike dropped the requirement rather than the rewrite, on the
+//! grounds that new panes are being made anyway.
+//!
+//! **`n` and `q` are not bound to anything now.** They were briefly kept as cancel
+//! aliases, on the theory that somebody used to pressing `n` would otherwise destroy the
+//! pane it used to protect. Mike says `n` was never a habit of his, so the aliases
+//! defended against nothing. Pressing one does nothing at all and the dialog stays open,
+//! which is **not** the same as cancelling and is deliberately not the same: the
+//! destructive answer is one keystroke away, so an unbound key must not resolve the
+//! question in either direction.
 //!
 //! A dismissed popup, a popup that could not be opened, a question that timed out, and
 //! an answer nobody recognises all mean **`esc`**. That reasoning is unchanged by losing
@@ -49,6 +63,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use crossterm::event::{KeyCode, KeyModifiers, MouseEventKind};
 use serde_json::json;
 
 use crate::api::Client;
@@ -331,6 +346,8 @@ pub fn run_popup() -> Result<(), String> {
     println!("  y    close it and rebuild the tab");
     println!("  esc  change nothing");
     println!();
+    println!("  A click anywhere in this pane also changes nothing.");
+    println!();
     use std::io::Write;
     let _ = std::io::stdout().flush();
 
@@ -364,12 +381,77 @@ fn read_choice() -> &'static str {
     }
 }
 
-fn read_key() -> Option<&'static str> {
-    use crossterm::event::{read, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+/// What one key means, or `None` for "not an answer, keep waiting".
+///
+/// Pure, and separated from the reading loop for the same reason `decide` is separated
+/// from the wait: the loop needs a terminal and this does not, so every binding is
+/// checked by the suite rather than only by hand.
+///
+/// **An unlisted key is ignored and the dialog stays open.** That is not the same as
+/// cancelling, and the difference matters: the destructive answer is one keystroke away,
+/// so a key nobody bound must not resolve the question in either direction.
+fn key_answer(code: KeyCode, modifiers: KeyModifiers) -> Option<&'static str> {
+    match code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => Some(CLOSE_IT),
+        KeyCode::Esc => Some(DO_NOTHING),
+        // Ctrl-C in raw mode is a key event, not a signal, and somebody pressing it
+        // means to get out.
+        KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => Some(DO_NOTHING),
+        _ => None,
+    }
+}
 
-    enable_raw_mode().ok()?;
-    let answer = loop {
+/// What one mouse event means, or `None` for "not an answer, keep waiting".
+///
+/// **A button press dismisses, and nothing else does.** Motion is not an answer: mouse
+/// capture reports movement as well as clicks, so acting on it would close the dialog
+/// the instant the pointer crossed the pane. Scrolling is not an answer either, because
+/// it is not a click.
+///
+/// **No mouse event can ever confirm.** A stray click destroying an agent's work is the
+/// failure this whole dialog exists to prevent, so the destructive answer stays on an
+/// explicit `y`.
+///
+/// Any button qualifies. There is nothing to aim at in this dialog, so there is no
+/// reading of a right-click that differs from a left one: both mean "get out".
+fn mouse_answer(kind: MouseEventKind) -> Option<&'static str> {
+    match kind {
+        MouseEventKind::Down(_) => Some(DO_NOTHING),
+        _ => None,
+    }
+}
+
+/// Raw mode and mouse capture, restored on every way out.
+///
+/// A `Drop` guard rather than a call after the loop, because the terminal state is the
+/// pane's and outlives this function on every path a plain call would miss: an early
+/// return, an error, a panic. A pane left in raw mode with mouse reporting on is a pane
+/// that prints escape sequences at whoever uses it next.
+struct TerminalState;
+
+impl TerminalState {
+    fn enter() -> Option<TerminalState> {
+        crossterm::terminal::enable_raw_mode().ok()?;
+        // Measured on 0.9.0: Herdr forwards a click inside a plugin pane to that pane as
+        // an SGR sequence, rebased to pane-local coordinates, and does not forward a
+        // click outside it. This is the request that makes it do so.
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+        Some(TerminalState)
+    }
+}
+
+impl Drop for TerminalState {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+fn read_key() -> Option<&'static str> {
+    use crossterm::event::{read, Event, KeyEvent, KeyEventKind};
+
+    let _terminal = TerminalState::enter()?;
+    loop {
         match read() {
             Ok(Event::Key(KeyEvent {
                 code,
@@ -382,34 +464,20 @@ fn read_key() -> Option<&'static str> {
                 if kind != KeyEventKind::Press {
                     continue;
                 }
-                match code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') => break CLOSE_IT,
-                    // `n` is deliberately NOT an acting key. It used to keep the agent
-                    // and build around it, and somebody with that habit pressing it now
-                    // must change nothing rather than destroy the pane.
-                    KeyCode::Esc
-                    | KeyCode::Char('n')
-                    | KeyCode::Char('N')
-                    | KeyCode::Char('q')
-                    | KeyCode::Char('Q') => break DO_NOTHING,
-                    // Ctrl-C in raw mode is a key event, not a signal, and it means
-                    // the same as Esc.
-                    KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
-                        break DO_NOTHING
-                    }
-                    // Any other key is ignored, as in any dialog. The three choices are
-                    // on screen, and guessing at an unlisted key is how a misfire
-                    // becomes a rearranged workspace.
-                    _ => continue,
+                if let Some(answer) = key_answer(code, modifiers) {
+                    return Some(answer);
                 }
             }
-            // Anything that is not a key, such as a resize, is not an answer.
+            Ok(Event::Mouse(event)) => {
+                if let Some(answer) = mouse_answer(event.kind) {
+                    return Some(answer);
+                }
+            }
+            // Anything else, such as a resize, is not an answer.
             Ok(_) => continue,
-            Err(_) => break DO_NOTHING,
+            Err(_) => return Some(DO_NOTHING),
         }
-    };
-    let _ = disable_raw_mode();
-    Some(answer)
+    }
 }
 
 fn read_line() -> &'static str {
@@ -427,6 +495,8 @@ fn read_line() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const NONE: KeyModifiers = KeyModifiers::NONE;
 
     #[test]
     fn the_two_words_map_to_the_two_answers() {
@@ -499,6 +569,94 @@ mod tests {
             .unwrap()
             .contains("never started"));
         assert!(decide(Ended::TimedOut).1.unwrap().contains("unanswered"));
+    }
+
+    #[test]
+    fn only_y_confirms_and_only_escape_or_ctrl_c_cancels() {
+        assert_eq!(key_answer(KeyCode::Char('y'), NONE), Some(CLOSE_IT));
+        assert_eq!(key_answer(KeyCode::Char('Y'), NONE), Some(CLOSE_IT));
+        assert_eq!(key_answer(KeyCode::Esc, NONE), Some(DO_NOTHING));
+        assert_eq!(
+            key_answer(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            Some(DO_NOTHING)
+        );
+    }
+
+    #[test]
+    fn the_letter_aliases_for_cancelling_are_gone_and_do_not_cancel() {
+        // `n` and `q` were bound to defend against a habit Mike says he never had. An
+        // unbound key must be ignored rather than reassigned, and ignored is not
+        // cancelled: the dialog stays open and waits for a real answer.
+        for code in [
+            KeyCode::Char('n'),
+            KeyCode::Char('N'),
+            KeyCode::Char('q'),
+            KeyCode::Char('Q'),
+        ] {
+            assert_eq!(key_answer(code, NONE), None, "{:?} still answers", code);
+        }
+    }
+
+    #[test]
+    fn an_unbound_key_is_ignored_rather_than_answering_either_way() {
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char(' '),
+            KeyCode::Char('x'),
+            KeyCode::Backspace,
+            KeyCode::Tab,
+            KeyCode::Up,
+            KeyCode::F(1),
+        ] {
+            assert_eq!(key_answer(code, NONE), None, "{:?} answered", code);
+        }
+        // A bare `c` is not Ctrl-C, and reading it as one would put the modifier check
+        // there for nothing.
+        assert_eq!(key_answer(KeyCode::Char('c'), NONE), None);
+    }
+
+    #[test]
+    fn a_click_dismisses_and_no_mouse_event_can_ever_confirm() {
+        use crossterm::event::MouseButton;
+
+        for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+            assert_eq!(
+                mouse_answer(MouseEventKind::Down(button)),
+                Some(DO_NOTHING),
+                "{:?} did not dismiss",
+                button
+            );
+        }
+        // The safety property, stated as its own assertion rather than left implied by
+        // the arm above: a stray click destroying an agent's work is the failure this
+        // dialog exists to prevent.
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Moved,
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+        ] {
+            assert_ne!(mouse_answer(kind), Some(CLOSE_IT), "{:?} confirmed", kind);
+        }
+    }
+
+    #[test]
+    fn moving_or_scrolling_is_not_an_answer() {
+        // Mouse capture reports motion as well as clicks. Acting on it would close the
+        // dialog the instant the pointer crossed the pane, before it had been read.
+        for kind in [
+            MouseEventKind::Moved,
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+            MouseEventKind::ScrollLeft,
+            MouseEventKind::ScrollRight,
+            MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+        ] {
+            assert_eq!(mouse_answer(kind), None, "{:?} answered", kind);
+        }
     }
 
     #[test]

@@ -515,6 +515,33 @@ process id to a file whose path travels in `plugin.pane.open`'s `env` map.
 `[[panes]]` accepts `width` and `height` only when `placement = "popup"`. The
 placement enum is `overlay`, `popup`, `split`, `tab`, `zoomed`.
 
+**A second popup is refused.** `plugin.pane.open` answers `ui_busy` with "a popup pane
+is already open" while one is up, which is a fourth thing it can answer besides `ok`.
+
+### A click inside a plugin pane is forwarded to it
+
+Measured 2026-09-10 on 0.9.0. This needed a real UI client, so it was taken in an
+isolated server with `herdr --session mouse` attached inside a pty, driven by writing
+SGR mouse sequences into that pty and reading what the pane's own process received.
+
+**The client turns mouse reporting on for itself** the moment it attaches, emitting
+`1000h 1002h 1003h 1015h 1006h`. So `ui.mouse_capture` defaults to on.
+
+**A click inside a plugin pane arrives at that pane's pty**, SGR-encoded and **rebased
+to pane-local coordinates**. A click at screen (60, 20) arrived as `\x1b[<0;14;4M`
+followed by `\x1b[<0;14;4m`, and one at (70, 22) as `<0;24;6M` — a constant origin
+offset, so the coordinates are the pane's own rather than the screen's.
+
+**A click outside the pane is not forwarded**, so a pane cannot see clicks meant for
+anything else. Right-click is forwarded the same way, as `<2;...`.
+
+The pane had requested reporting itself (`1000/1002/1003/1006`), which is what
+`crossterm`'s `EnableMouseCapture` emits, so that is the state the finding holds for.
+
+Two controls ran alongside: keystrokes reached the pane throughout, and a click outside
+the pane produced nothing in the same log. Without the second one, "no event arrived"
+and "the pane was not listening" would be indistinguishable.
+
 ### `layout.apply` builds a whole tab in one call, and destroys the old one
 
 Measured on 0.9.0, 2026-09-09, in an isolated server. Present at protocol 20 too.

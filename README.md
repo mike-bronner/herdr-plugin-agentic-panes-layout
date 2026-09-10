@@ -138,24 +138,26 @@ a flag to get the rebuild.
 the tabs your layout names are touched: a tab it does not mention survives every
 rebuild, so one keypress can never cost you a tab you were working in.
 
-If a pane of that tab is **running an agent**, you are asked first, in a popup, and
-it takes **one keypress**:
+If a pane of that tab is **running an agent**, you are asked first, in a popup:
 
-| Key | What happens |
+| What you do | What happens |
 | --- | --- |
 | `y` | Replaces the tab, agents and all, and rebuilds it clean. |
-| `esc` | **Changes nothing at all.** |
+| `esc`, `Ctrl-C`, or a click anywhere in the pane | **Changes nothing at all.** |
 
-**Anything that is not `y` means `esc`**: a popup you close, one you ignore, one that
-cannot be opened, an answer nobody recognises. Those are the same class of event as a
-misfire, so they cost nothing, and the run says which one happened rather than going
-quiet. An agent mid-turn holds work that cannot be recovered, so silence never counts
-as consent.
+**Only `y` acts.** A click can dismiss but can never confirm, because a stray click
+destroying an agent's work is the failure the dialog exists to prevent. Any other key
+does nothing and the dialog waits, which is not the same as cancelling.
 
-`n` is still bound, and it means `esc`. It used to keep the agent and rebuild the
-layout around it, which this version cannot do — Herdr's layout call replaces a tab
-wholesale and cannot carry a running agent into the new arrangement. It stays bound
-so an old habit changes nothing rather than destroying the pane it was protecting.
+**Anything that stops the question being answered also means "change nothing"**: a
+popup you close, one you ignore, one that cannot be opened, an answer nobody
+recognises. Those are the same class of event as a misfire, so they cost nothing, and
+the run says which one happened rather than going quiet. An agent mid-turn holds work
+that cannot be recovered, so silence never counts as consent.
+
+There used to be a third answer on `n`, which kept the agent and rebuilt the layout
+around it. This version cannot do that: Herdr's layout call replaces a tab wholesale
+and cannot carry a running agent into the new arrangement.
 
 A rebuild that touches no agent pane asks nothing at all and simply proceeds.
 

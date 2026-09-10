@@ -538,12 +538,12 @@ default, and `panes_of_another_tab_are_not_destroyed_by_a_rebuild` pins it.
 
 An agent mid-turn holds work that cannot be recovered, so a rebuild that would
 destroy one **asks first**, in a popup. There is no force flag: the question is the
-mechanism. It takes **one keypress**, and there are **two** answers.
+mechanism. There are **two** answers.
 
-| Key | Word on the wire | What happens |
+| What the user does | Word on the wire | What happens |
 | --- | --- | --- |
 | `y` | `close` | The tab is replaced, agents and all, and rebuilt clean. |
-| `esc` | `nothing` | **Not one pane of the tab is touched.** |
+| `esc`, `Ctrl-C`, or a click anywhere in the pane | `nothing` | **Not one pane of the tab is touched.** |
 
 There used to be a third. `n` kept the running agent and rebuilt the layout **around**
 it, and it is gone because this engine cannot express it: a `tab_id` replaces the tab
@@ -551,10 +551,31 @@ wholesale, and `pane_id` on a leaf is output-only, so a live agent cannot be car
 into a new tree. Mike dropped the requirement rather than the rewrite, on the grounds
 that new panes are being made anyway.
 
-**`n` is still bound, and it now means `esc`.** Somebody with the old habit pressing
-it must change nothing, not destroy the pane they were trying to protect. It is
-deliberately not listed on the popup, because listing it would promise an outcome the
-engine cannot produce.
+**`n` and `q` are bound to nothing.** They were briefly kept as cancel aliases, on the
+theory that an old `n` habit would otherwise destroy the pane it used to protect. Mike
+says `n` was never a habit of his, so they defended against nothing. An unbound key is
+ignored and the dialog stays open, which is **not** cancelling: the destructive answer
+is one keystroke away, so a key nobody bound must not resolve the question either way.
+
+### A click dismisses, and can never confirm
+
+Measured on 0.9.0, in an isolated server with a real UI client driven through a pty. A
+click **inside** a plugin pane is forwarded to that pane as an SGR sequence, rebased to
+pane-local coordinates: a click at screen (60, 20) arrived as `<0;14;4M`. A click
+**outside** it was not forwarded at all. Right-click is forwarded too.
+
+So the whole pane is the dismiss target. There is nothing to aim at in this dialog, no
+buttons and no regions, so "click to get out" can only mean any click anywhere.
+
+**No mouse event can reach the destructive answer.** A stray click destroying an
+agent's work is the failure this dialog exists to prevent, so `close` stays on an
+explicit `y`. Motion and scrolling are not answers either: mouse capture reports
+movement as well as clicks, and acting on it would close the dialog the instant the
+pointer crossed the pane, before it had been read.
+
+Raw mode and mouse capture are restored by a `Drop` guard rather than a call after the
+loop, so an early return, an error or a panic cannot leave the pane in raw mode with
+mouse reporting on, printing escape sequences at whoever uses it next.
 
 Everything that is not the one acting word means `esc`: a dismissed popup, a popup
 that could not be opened, a popup that never started, a timeout, an answer nobody
@@ -576,9 +597,10 @@ danger: the two situations are separated before the question is asked, not after
 
 ### Why one keypress and no ratatui
 
-`crossterm 0.29` reads the key; there is no ratatui. A yes/no needs no widgets, no
-layout engine and no render loop, and Herdr already draws the pane frame and puts the
-manifest's `title` on it. Three `println!`s and one key is the whole interface. The
+`crossterm 0.29` reads the key and the click; there is no ratatui. A yes/no needs no
+widgets, no layout engine and no render loop, and Herdr already draws the pane frame
+and puts the manifest's `title` on it. A few `println!`s and one event is the whole
+interface. The
 version is pinned to what Herdr's own `Cargo.toml` uses, which keeps the property that
 every crate here is one Herdr already depends on.
 
@@ -597,7 +619,9 @@ is one language.
 
 Three measured facts force the design, and each was checked rather than assumed:
 
-1. `plugin.pane.open` answers `{"type":"ok"}` and **nothing else** — no pane id.
+1. `plugin.pane.open` answers `{"type":"ok"}` on success and **carries no pane id**.
+   (It can fail: `ui_busy` when a popup is already open, for one. What it never does
+   is hand back a handle.)
 2. **A plugin pane does not appear in `pane.list`.**
 3. The pane's command process **does** run, including on a server with no UI client.
 

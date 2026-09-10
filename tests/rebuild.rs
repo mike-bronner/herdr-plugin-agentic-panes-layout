@@ -775,8 +775,8 @@ fn the_popup_says_which_way_it_went() {
 #[test]
 fn the_popup_offers_two_choices_and_no_more() {
     // The screen is the whole interface, so an offer it does not honour is a lie. `n`
-    // used to be listed as its own choice; it now means the same as `esc`, and listing
-    // it would promise an outcome the engine cannot produce.
+    // used to be listed as its own choice; it is not bound to anything now, and listing
+    // it would promise an outcome nothing produces.
     let (_, shown) = ask_popup("", &[]);
     assert!(shown.contains("close it and rebuild the tab"), "{}", shown);
     assert!(shown.contains("change nothing"), "{}", shown);
@@ -785,6 +785,32 @@ fn the_popup_offers_two_choices_and_no_more() {
         "the retired third choice is still on screen: {}",
         shown
     );
+}
+
+#[test]
+fn the_popup_offers_no_key_that_is_not_bound() {
+    // A dialog listing a key that does nothing is worse than one listing fewer, because
+    // the user presses it and reads the silence as a broken plugin. `n` and `q` were
+    // both bound once and are not now, so neither may be offered as a choice.
+    let (_, shown) = ask_popup("", &[]);
+    for line in shown.lines() {
+        let offered = line.trim_start();
+        for gone in ["n ", "N ", "q ", "no ", "esc, n"] {
+            assert!(
+                !offered.starts_with(gone),
+                "the popup still offers an unbound key: {:?}",
+                line
+            );
+        }
+    }
+}
+
+#[test]
+fn the_popup_tells_the_user_a_click_dismisses() {
+    // Herdr forwards a click inside a plugin pane to that pane, measured on 0.9.0, so
+    // the binding is real. An offer the screen does not make is a feature nobody finds.
+    let (_, shown) = ask_popup("", &[]);
+    assert!(shown.to_lowercase().contains("click"), "{}", shown);
 }
 
 #[test]
