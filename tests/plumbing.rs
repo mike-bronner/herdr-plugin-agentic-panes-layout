@@ -521,14 +521,100 @@ impl Drop for TempDir {
 }
 
 #[test]
-fn the_hook_acts_on_one_event_and_passes_the_gate_flag() {
-    // worktree.opened is subscribed so Herdr logs it while a design question is
-    // settled, and must not reach the layout. The gate flag is what carries the
-    // focused-workspace check, so dropping it would lay out an unfocused
-    // workspace and start an agent in whatever the user is looking at.
+fn the_hook_acts_on_both_worktree_events_and_passes_the_gate_flag() {
+    // worktree.opened used to be subscribed as log-only instrumentation while a design
+    // question was open. It is resolved: opening a workspace lays it out, because that
+    // is what the plugin is for.
+    //
+    // Measured on 0.9.0 that the two events are disjoint per action, which is what makes
+    // a second ACTING subscription safe: `worktree create` emits only worktree.created,
+    // with and without --focus, and `worktree open` emits only worktree.opened. Two
+    // concurrent runs splitting one pane cannot arise from a single action.
+    //
+    // The gate flag carries the focused-workspace check. Dropping it would lay out an
+    // unfocused workspace and start an agent in whatever the user is looking at, and a
+    // second acting subscription doubles the chances of getting that wrong.
     let hook = read("bin/on-event");
-    assert!(hook.contains(r#"[ "${HERDR_PLUGIN_EVENT:-}" = "worktree.created" ] || exit 0"#));
-    assert!(hook.contains("--from-event"));
+    for event in ["worktree.created", "worktree.opened"] {
+        assert!(hook.contains(event), "the hook must act on {}", event);
+    }
+    assert!(
+        hook.contains("--from-event"),
+        "the focused gate must be passed"
+    );
+}
+
+/// Run `bin/on-event` for real, against a stub layout binary.
+///
+/// Reading the hook's text proves it mentions an event; running it proves it acts on
+/// one. Mutation testing found that gap: changing which events the hook accepts left
+/// every test green, because nothing executed the script.
+fn run_hook(event: Option<&str>) -> String {
+    let dir = TempDir::new();
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    let stub = dir.join("bin/agent-layout");
+    std::fs::write(&stub, "#!/bin/sh\nprintf 'HANDED-OFF %s\\n' \"$*\"\n").unwrap();
+    set_executable(&stub);
+
+    let mut command = std::process::Command::new("sh");
+    command
+        .arg("bin/on-event")
+        .current_dir(root())
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("HERDR_PLUGIN_ROOT", dir.path());
+    if let Some(event) = event {
+        command.env("HERDR_PLUGIN_EVENT", event);
+    }
+    let out = command.output().expect("cannot run the hook");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the hook must never exit non-zero: Herdr would record it as a failed plugin \
+         command, and \"this event was not mine\" is not a failure"
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+#[test]
+fn the_hook_hands_off_for_both_worktree_events() {
+    // Both act now. worktree.opened used to be log-only instrumentation.
+    for event in ["worktree.created", "worktree.opened"] {
+        let out = run_hook(Some(event));
+        assert!(
+            out.contains("HANDED-OFF"),
+            "{} must reach the layout: {:?}",
+            event,
+            out
+        );
+        assert!(
+            out.contains("--from-event"),
+            "{} must carry the focused gate: {:?}",
+            event,
+            out
+        );
+    }
+}
+
+#[test]
+fn the_hook_ignores_every_other_event() {
+    // A subscription nobody argued for must not act even if it somehow reaches the
+    // hook, and neither must a missing variable.
+    for event in [
+        Some("workspace.created"),
+        Some("workspace.focused"),
+        Some("worktree.removed"),
+        Some(""),
+        None,
+    ] {
+        let out = run_hook(event);
+        assert!(
+            !out.contains("HANDED-OFF"),
+            "{:?} must not reach the layout: {:?}",
+            event,
+            out
+        );
+    }
 }
 
 #[test]

@@ -283,6 +283,87 @@ fn a_payload_that_cannot_be_read_is_refused() {
 }
 
 #[test]
+fn an_opened_workspace_is_laid_out_like_a_created_one() {
+    // Resolved by Mike: opening a workspace should lay it out, because that is what the
+    // plugin is for. worktree.opened used to be subscribed as log-only instrumentation.
+    //
+    // Safe as a second ACTING subscription because the two events are disjoint per
+    // action, measured on 0.9.0: `worktree create` emits only worktree.created, with and
+    // without --focus, and `worktree open` emits only worktree.opened. The race the old
+    // design note feared, two runs splitting one pane, cannot arise from one action.
+    let stub = Stub::start(Script::default());
+    let opened = json!({"event": "worktree_opened",
+                        "data": {"type": "worktree_opened", "already_open": false,
+                                 "workspace": {"workspace_id": "w9", "focused": true}}})
+    .to_string();
+    let run = run_with_env(
+        &stub,
+        &["--from-event"],
+        None,
+        &[("HERDR_PLUGIN_EVENT_JSON", &opened)],
+    );
+    assert_eq!(run.status, 0, "{}", run.stderr);
+    assert_eq!(
+        stub.params_for("tab.rename").len(),
+        1,
+        "{:?}",
+        stub.methods()
+    );
+    assert_eq!(stub.params_for("agent.start").len(), 1);
+}
+
+#[test]
+fn an_unfocused_opened_workspace_is_still_refused() {
+    // The gate has to hold on BOTH acting paths. A second subscription doubles the
+    // chances of laying out whatever the user is actually looking at.
+    let stub = Stub::start(Script::default());
+    let opened = json!({"event": "worktree_opened",
+                        "data": {"type": "worktree_opened", "already_open": false,
+                                 "workspace": {"workspace_id": "w9", "focused": false}}})
+    .to_string();
+    let run = run_with_env(
+        &stub,
+        &["--from-event"],
+        None,
+        &[("HERDR_PLUGIN_EVENT_JSON", &opened)],
+    );
+    assert_eq!(run.status, 0, "{}", run.stderr);
+    assert!(stub.requests().is_empty(), "{:?}", stub.requests());
+}
+
+#[test]
+fn reopening_an_already_open_workspace_changes_nothing() {
+    // `already_open: true` is what reopening produces, measured on 0.9.0. The tab-name
+    // guard is what makes it a no-op rather than a second layout, and the event path
+    // keeps that guard. Confirmed here rather than assumed.
+    let stub = Stub::start(Script {
+        tabs: tabs_labelled(&["agent"]),
+        ..Script::default()
+    });
+    let opened = json!({"event": "worktree_opened",
+                        "data": {"type": "worktree_opened", "already_open": true,
+                                 "workspace": {"workspace_id": "w9", "focused": true}}})
+    .to_string();
+    let run = run_with_env(
+        &stub,
+        &["--from-event"],
+        None,
+        &[("HERDR_PLUGIN_EVENT_JSON", &opened)],
+    );
+    assert_eq!(run.status, 0, "{}", run.stderr);
+    assert!(
+        stub.changing().is_empty(),
+        "reopening must be a no-op: {:?}",
+        stub.changing()
+    );
+    assert!(
+        run.says("left agent alone, already there"),
+        "{}",
+        run.stderr
+    );
+}
+
+#[test]
 fn a_missing_payload_variable_is_refused() {
     let stub = Stub::start(Script::default());
     let run = run(&stub, &["--from-event"], None);

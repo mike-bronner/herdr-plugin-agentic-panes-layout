@@ -1,7 +1,10 @@
 #!/bin/sh
 set -eu
 
-[ "${HERDR_PLUGIN_EVENT:-}" = "worktree.created" ] || exit 0
+case "${HERDR_PLUGIN_EVENT:-}" in
+    worktree.created|worktree.opened) ;;
+    *) exit 0 ;;
+esac
 
 PLUGIN_ROOT="${HERDR_PLUGIN_ROOT:-$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)}"
 

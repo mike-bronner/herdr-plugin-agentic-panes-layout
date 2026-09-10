@@ -41,15 +41,70 @@ fn agent_not_ready_is_a_success_with_its_own_message() {
 }
 
 #[test]
-fn agent_pane_busy_is_still_fatal() {
-    // Deliberately out of scope: the pane's shell is not yet interactive when the
-    // hook fires, and Herdr exposes no readiness probe to wait on. Reclassifying
-    // this one would hide a layout that really did fail.
+fn a_busy_pane_is_waited_out_rather_than_reported() {
+    // The failure this fixes. A real worktree creation logged "agent target pane wF:p1
+    // is not an available shell (agent_pane_busy)", panes built correctly and no agent.
+    // The pane's shell simply had not reached its prompt yet: measured at 230-260ms for
+    // this user's zsh, dominated by `mise activate`.
+    let stub = Stub::start(Script::default().busy_for(2));
+    let run = run(&stub, &[], None);
+    assert_eq!(run.status, 0, "{}", run.stderr);
+    assert_eq!(
+        names(&stub).len(),
+        3,
+        "two busy answers then the real start: {:?}",
+        names(&stub)
+    );
+    assert!(run.says("was not at a prompt yet"), "{}", run.stderr);
+}
+
+#[test]
+fn waiting_for_a_pane_does_not_burn_agent_names() {
+    // The two retries are different in kind. A taken name is permanent, so that retry
+    // changes the name. A busy pane is transient, so this one must NOT: coming back
+    // under `proj-one-3` because the shell was slow would break the reservation that
+    // `herdr agent prompt <name>` depends on.
+    let stub = Stub::start(Script::default().busy_for(3));
+    run(&stub, &[], None);
+    let tried = names(&stub);
+    assert!(
+        tried.iter().all(|n| n == "proj-one"),
+        "the name must not advance while waiting: {:?}",
+        tried
+    );
+}
+
+#[test]
+fn a_pane_that_is_never_free_is_fatal_and_says_what_herdr_said() {
+    // Bounded on purpose. A pane held by a real editor or a running command never
+    // becomes free, and an unbounded wait would turn a clear failure into a hung hook.
+    // Slow by design: it spends the whole 5s budget before giving up.
     let stub = Stub::start(Script::default().agent_error("agent_pane_busy"));
     let run = run(&stub, &[], None);
     assert_eq!(run.status, 1);
     assert!(run.says("did not start"), "{}", run.stderr);
+    // The message has to be about the pane, not about a slow shell.
+    assert!(run.says("still busy after"), "{}", run.stderr);
+    assert!(run.says("something is running in it"), "{}", run.stderr);
+    // And it must carry Herdr's own words. A silent give-up is the invisibility this
+    // plugin has spent its recent history removing.
+    assert!(run.says("agent_pane_busy"), "{}", run.stderr);
     assert!(!run.says("waiting on a prompt"), "{}", run.stderr);
+}
+
+#[test]
+fn the_wait_is_bounded_rather_than_open_ended() {
+    // The bound, asserted as a real elapsed time rather than only as a constant. A
+    // regression to an unbounded loop would hang here instead of failing.
+    let stub = Stub::start(Script::default().agent_error("agent_pane_busy"));
+    let started = std::time::Instant::now();
+    let run = run(&stub, &[], None);
+    assert_eq!(run.status, 1);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "the wait must be bounded: {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
@@ -202,17 +257,23 @@ fn agent_not_ready_on_a_retried_name_is_still_a_success() {
 
 #[test]
 fn another_error_code_during_the_retry_is_still_fatal() {
-    // Only agent_name_taken is retried. A different failure on the second attempt
-    // must stop, not spin.
+    // Two codes are retried and everything else stops at once. The fixture used to be
+    // agent_pane_busy, which is now one of the two, so it needed a genuinely fatal code
+    // instead: with the old one this asserted 2 attempts and saw 21.
     let stub = Stub::start(
         Script::default()
             .taken(&["proj-one"])
-            .agent_error("agent_pane_busy"),
+            .agent_error("unsupported_agent_kind"),
     );
     let run = run(&stub, &[], None);
     assert_eq!(run.status, 1);
     assert!(run.says("did not start"), "{}", run.stderr);
-    assert_eq!(names(&stub).len(), 2);
+    assert_eq!(
+        names(&stub).len(),
+        2,
+        "the taken name, then one fatal answer: {:?}",
+        names(&stub)
+    );
 }
 
 #[test]

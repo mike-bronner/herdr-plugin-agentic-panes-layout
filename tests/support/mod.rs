@@ -90,6 +90,9 @@ pub struct Script {
     /// The popup appears and then dies without answering, which is what closing the
     /// pane does.
     pub popup_dies_unanswered: bool,
+    /// `agent.start` answers `agent_pane_busy` for this many calls, then behaves
+    /// normally. Stands in for a pane whose shell has not reached its prompt yet.
+    pub busy_for: u32,
 }
 
 impl Default for Script {
@@ -104,6 +107,7 @@ impl Default for Script {
             fail_split: None,
             popup_answer: None,
             popup_dies_unanswered: false,
+            busy_for: 0,
         }
     }
 }
@@ -138,6 +142,12 @@ impl Script {
     /// The popup opens and is then closed without an answer.
     pub fn popup_dismissed(mut self) -> Script {
         self.popup_dies_unanswered = true;
+        self
+    }
+
+    /// The target pane is not at a prompt for the first `n` attempts.
+    pub fn busy_for(mut self, n: u32) -> Script {
+        self.busy_for = n;
         self
     }
 }
@@ -203,12 +213,13 @@ impl Stub {
         std::thread::spawn(move || {
             let splits = AtomicU32::new(0);
             let tabs = AtomicU32::new(1);
+            let starts = AtomicU32::new(0);
             for stream in listener.incoming() {
                 if thread_stop.load(Ordering::SeqCst) {
                     break;
                 }
                 let Ok(stream) = stream else { break };
-                serve(&stream, &script, &thread_log, &splits, &tabs);
+                serve(&stream, &script, &thread_log, &splits, &tabs, &starts);
             }
         });
 
@@ -293,6 +304,7 @@ fn serve(
     log: &Arc<Mutex<Vec<Value>>>,
     splits: &AtomicU32,
     tabs: &AtomicU32,
+    starts: &AtomicU32,
 ) {
     let mut line = String::new();
     if BufReader::new(stream).read_line(&mut line).is_err() || line.trim().is_empty() {
@@ -313,18 +325,20 @@ fn serve(
         .push(json!({"method": method, "params": params}));
 
     let id = request.get("id").cloned().unwrap_or(json!("stub"));
-    let answer = answer_for(&method, &params, script, splits, tabs, &id);
+    let answer = answer_for(&method, &params, script, splits, tabs, starts, &id);
     let mut out = stream;
     let _ = out.write_all(format!("{}\n", answer).as_bytes());
     let _ = out.flush();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn answer_for(
     method: &str,
     params: &Value,
     script: &Script,
     splits: &AtomicU32,
     tabs: &AtomicU32,
+    starts: &AtomicU32,
     id: &Value,
 ) -> Value {
     let fail = |code: &str| {
@@ -359,6 +373,11 @@ fn answer_for(
         "pane.rename" => ok(json!({"type": "pane_info", "pane": {"pane_id": "p1"}})),
         "pane.send_input" => ok(json!({"type": "ok"})),
         "agent.start" => {
+            // A pane that has not reached its prompt yet. Counted across calls so a
+            // test can have it become ready partway through.
+            if starts.fetch_add(1, Ordering::SeqCst) < script.busy_for {
+                return fail("agent_pane_busy");
+            }
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             if script.taken_names.contains(name) {
                 return fail("agent_name_taken");

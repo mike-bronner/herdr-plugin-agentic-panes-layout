@@ -93,16 +93,20 @@ neither cargo nor a built binary, it says so rather than going quiet.
 
 ## What it does
 
-`bin/on-event` is a `worktree.created` hook. It checks that the event is the one
-that means a worktree was made — `worktree.opened` is subscribed as well, but only
-so Herdr logs it while a design question is settled, in
-[`docs/open-questions.md`](docs/open-questions.md) — and hands off to the layout
-binary with `--from-event`.
+`bin/on-event` runs on **`worktree.created` and `worktree.opened`**: creating a
+worktree lays it out, and so does opening one. Anything else exits at once. It hands
+off to the layout binary with `--from-event`.
 
-The binary then refuses to act unless the new workspace is the **focused** one.
+The binary then refuses to act unless the workspace is the **focused** one.
 `herdr worktree create --no-focus` emits `worktree.created` with
 `"focused": false`, and laying out an unfocused workspace would start an agent in
 whatever you were looking at instead.
+
+Both events act, which needed checking rather than assuming: two acting subscriptions
+firing for one action would race to split the same pane. Measured on Herdr 0.9.0 that
+they are disjoint — `worktree create` emits only `worktree.created` and `worktree open`
+emits only `worktree.opened`. See
+[`docs/open-questions.md`](docs/open-questions.md).
 
 It then reads [`agent-layout.toml`](docs/configuration.md), picks a layout for the
 project, and applies it: rename or create each tab, split each pane out of the one
@@ -352,19 +356,22 @@ fatal too, rather than falling back to the focused one. That fallback would lay
 out whatever you happened to be looking at, which is the accident the flag exists
 to prevent.
 
-## Known limitation
+## Waiting for the shell
 
-`agent.start` sometimes fails with `agent_pane_busy` ("is not an available
-shell"). The hook fires within about two milliseconds of the workspace being
-created, and the new pane's shell has not always reached its interactive prompt by
-then.
+`agent.start` needs the target pane at an idle prompt, and the hook fires within about
+two milliseconds of the workspace existing. So the pane's shell is often still starting,
+and Herdr answers `agent_pane_busy` ("is not an available shell").
 
-Herdr has no probe for that specific state. There is no `pane wait-shell`, and a
-pane reports no `available` field. The closest thing, `pane.wait_for_output`, waits
-for text you name, which means guessing your shell prompt. So the plugin neither
-retries nor sleeps: the right wait is unmeasured, and a made-up one would only
-trade a visible failure for an invisible delay. The failure is reported as a toast,
-and pressing the keybinding afterwards finishes the layout.
+The plugin **waits it out**: up to 20 attempts, 250ms apart, a 5 second budget. Those
+numbers are measured rather than chosen — 250ms is one interactive shell startup on the
+machine this was built for, so the common case is caught on the second attempt, and 20
+of them absorbs a cold start where your rc is much slower than usual.
+
+The wait is **bounded on purpose**. A pane held by a real editor or a running command
+never becomes free, so an unbounded wait would turn a clear failure into a hang. If the
+budget runs out, the message says the pane is still busy and that something is running
+in it, rather than blaming a slow shell, and it quotes what Herdr said. Press the layout
+keybinding once the pane is free.
 
 `agent_not_ready` is a different outcome and is treated as success. Herdr documents
 it as "the agent is blocked during startup", which means the agent did start and is

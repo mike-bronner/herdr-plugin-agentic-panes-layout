@@ -615,13 +615,14 @@ server is the only thing that knows every live name at once.
 timeout costs nothing. Blocking is what makes a startup failure reportable at
 all. A `timeout_ms` is not passed, because it has a 3000ms minimum.
 
-Three outcomes, and they are the whole set:
+Four outcomes, and they are the whole set:
 
 | Error code | Outcome |
 | --- | --- |
 | `agent_not_ready` | **Success.** The agent did start and is waiting at a prompt. |
 | `agent_name_taken` | **Retry** under the next derived name, unless `--agent-name` supplied it. |
-| anything else | **Fatal**, `agent_pane_busy` and `timeout` included. |
+| `agent_pane_busy` | **Wait and retry** the same name, up to a bound. |
+| anything else | **Fatal**, `timeout` included. |
 
 Fatal is the default arm rather than a list, so a code Herdr adds later is
 reported instead of being silently swallowed.
@@ -631,15 +632,64 @@ blocked during startup while its name stays usable — the agent **did** start. 
 a fresh worktree that is Claude Code's trust-this-folder prompt, which is the
 normal case, and reporting it as a failed layout was the original bug.
 
-`agent_pane_busy` stays fatal deliberately. The pane's shell is not yet
-interactive when the hook fires, and Herdr exposes no readiness probe to wait on,
-so reclassifying it would hide a layout that really did fail.
+### Waiting out a busy pane
+
+`agent_pane_busy` used to be fatal, on the reasoning that Herdr exposes no readiness
+probe so any wait would be invented. A real worktree creation then produced exactly the
+failure that reasoning permitted: panes built correctly, no agent, and
+`agent target pane wF:p1 is not an available shell (agent_pane_busy)` in the log.
+Herdr wants the target pane at an idle interactive prompt with nothing in the
+foreground, and the hook fires within about 2ms of the workspace existing.
+
+So it is now waited out, and **the numbers come from a measurement rather than being
+round**:
+
+- **250ms between attempts** is one measured shell startup. This user's interactive
+  zsh takes 230-260ms to reach a prompt, over seven samples with their real rc, and
+  `mise activate` dominates it. One attempt per shell startup catches the common case
+  on the second try.
+- **20 attempts, a 5 second budget**, is about twenty shell startups. That absorbs a
+  cold start where the rc is far slower than steady state, which is the case that
+  produced the failure.
+
+**The two retries are different in kind, and are separate loops for that reason.**
+
+| | `agent_name_taken` | `agent_pane_busy` |
+| --- | --- | --- |
+| Nature | Permanent until something changes | Usually transient |
+| What the retry changes | The **name** | **Nothing**; it waits |
+| Delay between attempts | None; waiting would not help | 250ms; a different name would not help |
+
+That distinction is load-bearing. Advancing the name while waiting for a shell would
+come back under `proj-one-3` because the shell was slow, breaking the reservation that
+`herdr agent prompt <name>` depends on.
+
+**Bounded, for a reason the name retry does not share.** A pane held by a real editor
+or a running command never becomes free, and no amount of waiting fixes it. An
+unbounded wait would turn a clear failure into a hung hook. So the exhausted message
+says something different from the others: that the pane is still busy after the whole
+budget, so something is running in it rather than the shell being slow — and it carries
+Herdr's own wording, because a silent give-up is the invisibility this plugin has spent
+its recent history removing.
 
 ## `bin/on-event`: one gate, then a hand-off
 
-Only `worktree.created` is acted on. The compare is what makes the
-`worktree.opened` subscription log-only for free: Herdr records every event it
-spawns the hook for, and the hook exits before any layout runs.
+**Both worktree events act.** `worktree.created` and `worktree.opened` each run the
+layout, because opening a workspace should lay it out. Anything else exits at once.
+
+A second **acting** subscription was previously argued to be dangerous, and the
+argument was sound: two events firing about a millisecond apart, with Herdr not
+serializing hooks, would have two concurrent runs both see one free tab and both build
+it. The guard makes a later run safe, not a simultaneous one.
+
+It is safe because **the two events are disjoint per action**, measured on 0.9.0 with a
+probe plugin subscribing to both: `worktree create` emits only `worktree.created`, with
+and without `--focus`, and `worktree open` emits only `worktree.opened`. One action
+never produces both. The full table is in
+[`open-questions.md`](open-questions.md).
+
+A non-zero exit is **not** used to refuse an event, because Herdr would record it as a
+failed plugin command and "this event was not mine" is not a failure.
 
 A non-zero exit is **not** used to refuse an event, because Herdr would record it
 as a failed plugin command and "this event was not mine" is not a failure.

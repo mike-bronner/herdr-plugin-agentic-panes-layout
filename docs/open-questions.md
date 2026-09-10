@@ -1,89 +1,71 @@
 # Open questions
 
-Decisions this repo has deliberately not taken yet. Each carries the measurement
-behind it and the condition that resolves it.
+Decisions this repo has deliberately not taken yet, and the ones it has taken since.
+Each carries the measurement behind it and the condition that resolves it.
+
+A resolved question is kept rather than deleted when the risk it guarded against was
+real. The reasoning is what stops somebody undoing it later without knowing what it
+cost to settle.
 
 ---
 
-## The `worktree.opened` subscription is temporary instrumentation
+## RESOLVED: `worktree.opened` lays out the workspace
 
-**Status: unresolved. The exit condition below has not been reached.**
+**Status: resolved 2026-09-10, by branch 1 of the exit condition below.** Kept here
+rather than deleted, because the risk it was guarding against is real and the reason it
+does not apply is a measurement somebody should be able to find.
 
-`herdr-plugin.toml` subscribes two events, and they are **not peers**:
+Mike's decision, in his words: opening a workspace should lay it out, because that is
+what the plugin is for. Both events now act:
 
 | Event | Role |
 | --- | --- |
 | `worktree.created` | **Acts.** Runs the layout. |
-| `worktree.opened` | **Log-only instrumentation.** Deliberately does nothing. |
+| `worktree.opened` | **Acts.** Runs the layout. |
 
-It is log-only for free. Gate 1 in `bin/on-event` compares against
-`worktree.created`, so Herdr records the event and the hook exits before any
-layout runs.
+### The exit condition it met
 
-**Do not promote it to gate 1 "while you are here."** Promotion is a decision to
-take with the plugin log in hand, not a tidy-up alongside another change.
+The condition set on 2026-09-05 had three branches. Branch 1 was: `worktree.opened`
+logged with `already_open=false` means promote it, because nothing else lays that
+workspace out. Mike's log showed three `worktree.opened` events in a day, all doing
+nothing, and he resolved it directly rather than waiting for more evidence.
 
-### Why it was added
+### The race that made a second acting subscription dangerous, and why it does not apply
 
-Added 2026-09-05 to answer one question: what does prefix+ctrl+o
-(`open_worktree`) emit?
+The old note argued that two **acting** subscriptions would be actively wrong: the
+events fire about a millisecond apart, Herdr does not serialize hooks, and two
+concurrent runs would both see one free tab and **both build it**. The guard makes a
+*later* run safe, not a *simultaneous* one. That reasoning still stands.
 
-It exists because of a **known anomaly**. One worktree
-(`bible-models/update-for-migrations`, 2026-09-05 10:30:41) appeared with **no
-events logged at all**, while the plugin had been armed since 10:19:21 and was
-demonstrably logging events either side of it.
+It does not apply because **the two events are disjoint per action**, measured on 0.9.0
+rather than assumed:
 
-The leading hypothesis is that it was never a creation. An `open_worktree` on an
-existing checkout emits `worktree.opened`, which was not subscribed at the time,
-and unsubscribed is indistinguishable from silent.
+| Action | Events emitted |
+| --- | --- |
+| `herdr worktree create` | `worktree.created` only |
+| `herdr worktree create --focus` | `worktree.created` only |
+| `herdr worktree open` on a closed worktree | `worktree.opened` only, `already_open=false` |
+| `herdr worktree open` on an open one | `worktree.opened` only, `already_open=true` |
 
-The answer is not only diagnostic. Opening a worktree that has no workspace yet
-also produces a workspace with one bare pane, which wants the same layout. So
-this measurement can turn into a feature.
+A probe plugin subscribing to both, logging each with a timestamp, saw exactly one
+event per action in every case. So one action cannot produce two concurrent runs
+racing to split the same pane. The old note asserted this ("open emits no
+`worktree.created`"); it is now measured.
 
-### What has been measured so far
+**Reopening an already-open workspace is a no-op**, confirmed rather than assumed. The
+tab-name guard skips a tab whose name is already there, and the event path takes the
+skip branch rather than the rebuild branch.
 
-See [`herdr-behaviour.md`](herdr-behaviour.md) for the raw results. In summary,
-measured 2026-09-05 in an isolated server:
+### One consequence worth knowing
 
-- opening a worktree with no workspace emitted `worktree.opened` with
-  `already_open=false`, focused, `pane_count` 1
-- opening the same worktree again emitted `worktree.opened` with
-  `already_open=true` and the same `workspace_id`
-- **neither open emitted `worktree.created`**
-
-Because the two events do not co-occur, the double-fire hazard described below
-does not apply between them. What is unsettled is the **decision**, not the
-mechanics: `already_open=true` must not re-lay-out a workspace, and only real use
-shows how often each case occurs.
-
-### Read the log back with
-
-```sh
-herdr plugin log list --plugin mikebronner.agentic-panes-layout
-```
-
-### Exit condition
-
-This does not stay as it is. Once prefix+ctrl+o has been pressed on a real
-worktree and the log has been read, resolve it one of three ways:
-
-1. **`worktree.opened` logged with `already_open=false` → promote it.** Add it to
-   gate 1 in `bin/on-event` so it lays out that bare workspace. Nothing else lays
-   it out today, because open emits no `worktree.created`. Gate 2 (focused) and
-   the recipe's own pane-count guard cover the rest, and that guard is what makes
-   an `already_open=true` press a safe no-op.
-2. **`worktree.opened` logged only with `already_open=true` → delete the
-   subscription.** Those workspaces already exist and are already laid out.
-3. **`worktree.opened` never logged → delete the subscription.** The 10:30:41
-   anomaly stays unexplained, and the `open_worktree` hypothesis is dead.
-
-Cases 1 and 2 can both appear in the log, because `already_open` reports the
-state at the moment of the press. **Case 1 decides it**: it is the only case that
-leaves a bare workspace unstyled.
-
-`tests/test_on_event.py` pins the subscription list exactly, so resolving this is
-a one-line edit there alongside the manifest change.
+`herdr worktree open` from the CLI reports `focused: false` in its payload, and the
+workspace really is not focused afterwards. `worktree open` has no `--focus` flag.
+Since the focused gate is kept on both acting paths — laying out an unfocused workspace
+starts an agent in whatever the user is looking at — **a CLI `worktree open` will not
+lay out**. Whether Herdr's TUI focuses on open is unmeasured, because it needs an
+attached client. If opening through the TUI turns out not to focus either, this
+resolution has no effect in practice and the gate is what to revisit, not the
+subscription.
 
 ---
 
@@ -109,9 +91,12 @@ and the recipe's "already laid out?" guard reads pane count over the API. Two
 concurrent copies would both see one pane and **both would split it**. The guard
 makes a *later* run safe, not a *simultaneous* one.
 
-That is why the second subscription is log-only rather than acting. A
-subscription that only ever reaches the early exit in gate 1 cannot join that
-race, whatever it turns out to fire alongside.
+That reasoning is why a second acting subscription needed a measurement before it was
+allowed, rather than an assumption. It got one: see the resolved section above, where
+the two worktree events are shown to be disjoint per action.
+
+`workspace.created` and `workspace.focused` stay gone. Nothing has measured them as
+disjoint from anything, and the cost argument alone still rules them out.
 
 ---
 

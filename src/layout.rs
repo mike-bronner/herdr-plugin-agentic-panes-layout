@@ -447,9 +447,12 @@ enum Started {
     YesAtAPrompt,
     /// The name is taken. Only a derived name may retry.
     NameTaken(String),
-    /// Anything else, including `agent_pane_busy` and `timeout`. The default arm
-    /// is fatal rather than a list, so a code Herdr adds later is reported instead
-    /// of being silently swallowed.
+    /// The pane has not reached an idle prompt yet. **Transient**, so it is waited
+    /// out rather than reported, up to a bound.
+    PaneBusy(String),
+    /// Anything else, including `timeout`. The default arm is fatal rather than a
+    /// list, so a code Herdr adds later is reported instead of being silently
+    /// swallowed.
     No(String),
 }
 
@@ -458,8 +461,79 @@ fn classify(result: Result<(), api::CallError>) -> Started {
         Ok(()) => Started::Yes,
         Err(e) if e.code() == Some(name::NOT_READY) => Started::YesAtAPrompt,
         Err(e) if e.code() == Some(name::TAKEN) => Started::NameTaken(e.to_string()),
+        Err(e) if e.code() == Some(name::PANE_BUSY) => Started::PaneBusy(e.to_string()),
         Err(e) => Started::No(e.to_string()),
     }
+}
+
+/// Start an agent, waiting out a pane that has not reached its prompt yet.
+///
+/// **The two retries are different in kind, which is why they are separate loops.** A
+/// taken name is permanent until something changes, so that retry alters the input: a
+/// different name, tried at once, because waiting would not help. A busy pane is
+/// usually transient, so this retry alters nothing and simply waits, because a
+/// different name would not help either.
+///
+/// `PaneBusy` is returned only once the bound is exhausted, so the caller's name loop
+/// never sees a transient one.
+fn start_waiting_for_the_shell(
+    client: &Client,
+    agent_name: &str,
+    kind: &str,
+    pane_id: &str,
+    outcome: &mut Outcome,
+) -> Started {
+    let mut waited_ms = 0;
+    for attempt in 1..=name::BUSY_MAX_TRIES {
+        match classify(api::agent_start(client, agent_name, kind, pane_id)) {
+            Started::PaneBusy(why) => {
+                if attempt == name::BUSY_MAX_TRIES {
+                    return Started::PaneBusy(why);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(name::BUSY_WAIT_MS));
+                waited_ms += name::BUSY_WAIT_MS;
+            }
+            settled => {
+                // Worth saying. A pause with no explanation reads as a hang, and this
+                // is the failure the retry exists to fix.
+                if waited_ms > 0 {
+                    outcome.notes.push(format!(
+                        "{} was not at a prompt yet, so starting {} waited {}ms",
+                        pane_id, kind, waited_ms
+                    ));
+                }
+                return settled;
+            }
+        }
+    }
+    unreachable!("the loop returns on the last attempt")
+}
+
+/// The message when a pane never reached a prompt.
+///
+/// Deliberately different from the other failures. A pane still busy after the whole
+/// budget is not a slow shell: something is running in it, and telling the reader that
+/// is more useful than repeating that the agent did not start. Herdr's own wording is
+/// carried through, because a silent give-up is the invisibility this plugin has spent
+/// its recent history removing.
+fn busy_message(
+    target: &Target,
+    kind: &str,
+    agent_name: &str,
+    pane_id: &str,
+    why: String,
+) -> String {
+    format!(
+        "{}: panes laid out, but {} did not start as \"{}\". Pane {} was still busy after \
+         {}ms, so something is running in it rather than the shell being slow. Press the \
+         layout keybinding once it is free. Herdr said: {}",
+        target.label,
+        kind,
+        agent_name,
+        pane_id,
+        name::BUSY_WAIT_MS * u64::from(name::BUSY_MAX_TRIES - 1),
+        why
+    )
 }
 
 fn started_note(kind: &str, agent_name: &str) -> String {
@@ -481,7 +555,7 @@ fn start_exact(
     exact: &str,
     outcome: &mut Outcome,
 ) -> Result<(), Fatal> {
-    match classify(api::agent_start(client, exact, kind, pane_id)) {
+    match start_waiting_for_the_shell(client, exact, kind, pane_id, outcome) {
         Started::Yes => {
             outcome.notes.push(started_note(kind, exact));
             Ok(())
@@ -494,6 +568,7 @@ fn start_exact(
             "{}: the agent name \"{}\" given with --agent-name is already taken: {}",
             target.label, exact, why
         ))),
+        Started::PaneBusy(why) => Err(Fatal(busy_message(target, kind, exact, pane_id, why))),
         Started::No(why) => Err(Fatal(format!(
             "{}: panes laid out, but {} did not start as \"{}\": {}",
             target.label, kind, exact, why
@@ -511,7 +586,7 @@ fn start_derived(
     let base = name::derive(&target.label);
     for attempt in 1..=name::MAX_TRIES {
         let candidate = name::with_suffix(&base, attempt);
-        match classify(api::agent_start(client, &candidate, kind, pane_id)) {
+        match start_waiting_for_the_shell(client, &candidate, kind, pane_id, outcome) {
             Started::Yes => {
                 outcome.notes.push(started_note(kind, &candidate));
                 return Ok(());
@@ -527,6 +602,9 @@ fn start_derived(
                         target.label, base, candidate, why
                     )));
                 }
+            }
+            Started::PaneBusy(why) => {
+                return Err(Fatal(busy_message(target, kind, &candidate, pane_id, why)))
             }
             Started::No(why) => {
                 return Err(Fatal(format!(

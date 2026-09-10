@@ -2,6 +2,26 @@ pub const MAX_TRIES: u32 = 20;
 pub const MAX_LEN: usize = 32;
 pub const NOT_READY: &str = "agent_not_ready";
 pub const TAKEN: &str = "agent_name_taken";
+pub const PANE_BUSY: &str = "agent_pane_busy";
+
+/// How long to wait between attempts at a pane that is not yet at a prompt.
+///
+/// **250ms is one measured shell startup**, not a round number. Mike's own
+/// interactive zsh takes 230-260ms to reach a prompt, measured over seven samples
+/// with his real rc, and `mise activate` dominates that. So each attempt costs about
+/// one shell startup, and the common case is caught on the second try.
+pub const BUSY_WAIT_MS: u64 = 250;
+
+/// How many times to retry a busy pane before giving up.
+///
+/// 20 attempts is a **5 second** budget, roughly twenty measured shell startups. That
+/// absorbs a cold start where the rc is much slower than steady state, which is the
+/// case that produced the failure this exists to fix.
+///
+/// It is bounded for a reason that does not apply to the name retry. A pane occupied
+/// by a real editor or a running command **never** becomes free, and no amount of
+/// waiting fixes it. An unbounded wait would turn a clear failure into a hung hook.
+pub const BUSY_MAX_TRIES: u32 = 20;
 
 pub fn derive(workspace_label: &str) -> String {
     let lowered: String = workspace_label
