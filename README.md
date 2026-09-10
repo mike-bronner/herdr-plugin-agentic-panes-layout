@@ -368,10 +368,9 @@ automatic worktree path as well as when you invoke the layout yourself. Press an
 to dismiss it. It opens *after* the panes are built and nothing waits for it, so a
 warning never delays your workspace.
 
-This is a pane rather than a toast for a measured reason: with
-`ui.toast.delivery = "system"`, `notification.show` answers `shown: false` and the
-message is dropped before rendering, while a plugin pane opens regardless. Herdr also
-gives plugin toasts no severity, allows only one at a time, and rate-limits them.
+This is a pane rather than a toast for three measured reasons. Herdr gives plugin
+toasts no severity, so an error cannot look like an error. Only one toast is live at a
+time. And they are rate-limited, so a list of problems would lose all but the first.
 [`docs/configuration.md`](docs/configuration.md) has the measurements.
 
 Every diagnostic also goes to stderr, which is what

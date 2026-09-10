@@ -230,25 +230,27 @@ a warning, and gating pane creation on a dialog would turn it into a stall.
 `herdr plugin log list --plugin mikebronner.agentic-panes-layout` keeps. It is the
 record that survives.
 
-**One toast, at most.** A nudge for anyone running `ui.toast.delivery = "herdr"`; the
-popup carries the detail.
+**One toast, at most.** A nudge that something is wrong. The popup carries the detail.
 
 ### Why a toast was not enough
 
-Measured on Herdr 0.9.0, in one isolated server with `ui.toast.delivery = "system"`:
+Three limits, measured on Herdr 0.9.0, make a toast the wrong shape for a list of
+problems. There is **no severity**, because Herdr hardcodes every API-originated
+notification to one kind, so a plugin cannot make an error look like an error. **Only
+one toast is live at a time**, and the next answers `Busy`. And there is a **rate
+limit**. This plugin used to send one toast per diagnostic, so at best the first ever
+appeared.
 
-- `notification.show` answered `{"shown": false, "reason": "no_foreground_client"}` for
-  every call.
-- `plugin.pane.open` in the same server started the pane's process.
+A pane has none of those limits. It is our own terminal, carrying every issue at once.
 
-So config diagnostics sent as toasts were being dropped before they rendered. A pane is
-a different mechanism and does not consult the toast settings.
-
-Three further limits make a toast the wrong shape even where it does render. There is
-**no severity** — Herdr hardcodes every API-originated notification to one kind, so a
-plugin cannot make an error look like an error. **Only one toast is live at a time**,
-and the next answers `Busy`. And there is a **rate limit**. This plugin used to send one
-toast per diagnostic, so at best the first ever appeared.
+**A fourth reason used to be given here and it was wrong.** It said that under
+`ui.toast.delivery = "system"` every `notification.show` answered
+`{"shown": false, "reason": "no_foreground_client"}`, so the toast never rendered.
+That was over-generalised from an isolated server with **no UI client attached**, and
+the missing client was the cause rather than the setting. Measured against Mike's live
+server on 2026-09-10, with that setting unchanged on disk, the same call answers
+`shown: true`. See [`herdr-behaviour.md`](herdr-behaviour.md) for the correction in
+full. The three limits above are the real argument, and they were measured separately.
 
 ## Checking a file before you rely on it
 

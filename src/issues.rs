@@ -1,22 +1,24 @@
 //! Showing config problems in a popup pane this plugin styles itself.
 //!
-//! **Why not a toast.** `notification.show` is the only toast API and it cannot carry
-//! this. Measured on 0.9.0, in one isolated server holding Mike's own
-//! `ui.toast.delivery = "system"`:
+//! **Why not a toast.** `notification.show` is the only toast API, and three measured
+//! limits make it the wrong shape for a list of config problems.
 //!
-//! - `notification.show` answered `{"shown": false, "reason": "no_foreground_client"}`
-//!   for every call.
-//! - `plugin.pane.open` in the same server started the pane's process.
+//! - **No severity.** Herdr hardcodes every API-originated notification to one kind,
+//!   so a plugin cannot style an error differently from a success.
+//! - **One at a time.** Only one toast is live, and the next answers `Busy`.
+//! - **A rate limit**, on top of that. This plugin used to loop every diagnostic
+//!   through a toast, so at best the first one appeared.
 //!
-//! So a config diagnostic sent as a toast was being dropped before it rendered, which
-//! is why a broken config felt silent. A pane is a different mechanism and does not
-//! consult the toast settings at all.
+//! A pane sidesteps all three: our own terminal, our own colours, every issue in one
+//! place, no rate limit and no queue.
 //!
-//! Three more limits make a toast the wrong shape even where it does render. There is
-//! no severity: Herdr hardcodes every API-originated notification to one kind, so a
-//! plugin cannot style an error differently from a success. Only one toast is live at
-//! a time and the next answers `Busy`. And there is a rate limit. This plugin used to
-//! loop every diagnostic through a toast, so at best the first one appeared.
+//! **A fourth reason used to be given here and it was wrong.** This said that under
+//! `ui.toast.delivery = "system"` every call answered `no_foreground_client`, so the
+//! toast never rendered at all. That came from an isolated server with **no UI client
+//! attached**, and the absent client was the cause rather than the setting. Measured
+//! against Mike's live server on 2026-09-10, with that setting unchanged on disk, the
+//! same call answers `shown: true`. The three limits above are the real argument and
+//! they were measured separately.
 //!
 //! A pane sidesteps all of it: our own terminal, our own colours, every issue in one
 //! place, no rate limit.

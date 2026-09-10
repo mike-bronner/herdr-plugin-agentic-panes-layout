@@ -611,5 +611,46 @@ it replaced had.** Measured 2026-09-10, three ways:
 ```
 
 A `result` rather than an `error`, so a toast that the user has turned off is not
-a failure. Nothing in this plugin inspects `shown`, deliberately: the toast is
-best-effort and stderr carries the same message.
+a failure. **The `reason` is the useful part**: it says whether the message landed,
+and `shown` versus `no_foreground_client` is the difference between delivered and
+dropped.
+
+Nothing in this plugin reads it. That is a defect rather than a decision, and it is
+written up in [`open-questions.md`](open-questions.md): a caller that throws away a
+response telling it the message was dropped cannot know it went silent.
+
+#### CORRECTION: `delivery = "system"` does not suppress the toast
+
+An earlier finding here, and in three other files, said that under
+`ui.toast.delivery = "system"` every `notification.show` answered
+`{"shown": false, "reason": "no_foreground_client"}`, so plugin toasts never rendered.
+**That is wrong, and it was over-generalised from a headless measurement.**
+
+Measured 2026-09-10 against Mike's **live** server, with `delivery = "system"`
+unchanged on disk at `config.toml:28`:
+
+```
+$ herdr notification show "agent layout" --body "probe: checking notification delivery"
+{"id":"cli:notification:show","result":{"reason":"shown","shown":true,"type":"notification_show"}}
+```
+
+`shown: true`. Reproduced independently in a parallel session through both the CLI and
+a raw socket call shaped like this plugin's, with the toasts seen on screen.
+
+**The absent client was the cause, not the setting.** The original measurement was
+taken in an isolated server with no UI client attached, and it recorded its own limit
+at the time: `delivery = "herdr"` also answered `no_foreground_client` there, so the
+setting and the missing client could not be told apart. They can now, and it was the
+client.
+
+**The mechanism is not established, and is deliberately not asserted here.** Reading
+`src/app/api.rs` at v0.9.0 suggests `ToastDelivery::Terminal | ToastDelivery::System`
+maps straight to `NoForegroundClient` with no client check, which contradicts the live
+result. A separate `src/server/headless/notifications.rs` exists, so `app/api.rs` may
+not be the handler in force when a client is attached. Which path serves the call was
+not identified.
+
+What this does **not** overturn: the reasons a popup carries config diagnostics instead
+of a toast. Herdr hardcodes plugin toasts to one kind so an error cannot look like one,
+only one toast is live at a time, and there is a rate limit. Those were measured
+separately and still hold.

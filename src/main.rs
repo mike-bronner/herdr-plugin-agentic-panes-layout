@@ -300,10 +300,9 @@ fn run() -> Result<(), Exit> {
     // the only record that survives when nothing renders.
     //
     // Only ONE toast, though, and not one per diagnostic. Measured on 0.9.0: a second
-    // toast answers Busy, there is a rate limit, and under Mike's own
-    // `ui.toast.delivery = "system"` every one of them answers shown=false anyway. The
-    // old loop could therefore never have shown more than its first item. The popup
-    // below carries the detail; this line is a nudge for somebody on delivery = "herdr".
+    // toast answers Busy, and there is a rate limit on top of that. The old loop could
+    // therefore never have shown more than its first item. The popup below carries the
+    // detail; this line is the nudge that something is wrong.
     let mut problems: Vec<String> = loaded.diagnostics.clone();
     if let Some(note) = &chosen.diagnostic {
         problems.push(format!("{}: {}", target.label, note));

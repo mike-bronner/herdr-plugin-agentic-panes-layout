@@ -181,6 +181,41 @@ of them carries a live agent across.
 
 ---
 
+## Should `api::notify` read the `reason` it already receives?
+
+**Open. Mike's call, and deliberately not taken while writing this up.**
+
+`notification.show` answers with `shown` and a `reason`. That is Herdr telling the
+caller whether the message landed: `shown` means it rendered, `no_foreground_client`
+means it was dropped because nothing was there to draw it, `disabled` means the user
+turned toasts off.
+
+`api::notify` in [`../src/api.rs`](../src/api.rs) discards the whole response. Every
+toast this plugin sends is therefore fire-and-forget, and a dropped one is
+indistinguishable from a delivered one.
+
+**This is the same class of defect as the two this repository has already fixed.** The
+stale binary ran two commits behind and nothing said so, which is why `--version`
+exists. A green report was written from a suite that was red, which is why the rule is
+now to read the exit status. Here a response arrives, carrying the answer, and is
+thrown away unread. In all three the information was present and nobody looked at it.
+
+It has already cost something. The claim that plugin toasts never render under
+`ui.toast.delivery = "system"` survived in four files for a day, and reading `reason`
+on a live server would have contradicted it immediately.
+
+**What is not obvious is what to do with the answer**, which is why this is a question
+rather than a change. A dropped toast is not a failure of the layout, and the message
+is already on stderr where `herdr plugin log list` keeps it. Options, roughly in order
+of weight: log the reason to stderr when it is not `shown`, so the record says the
+toast went nowhere; do that only for messages that matter, since a dropped success
+notice is not worth a line; or leave it, on the grounds that stderr already has the
+content and the `reason` only adds delivery trivia.
+
+Worth deciding before adding any new caller that relies on a toast being seen.
+
+---
+
 ## Herdr version drift
 
 Every measurement recorded in this repo was taken against Herdr **0.8.2**. Herdr
