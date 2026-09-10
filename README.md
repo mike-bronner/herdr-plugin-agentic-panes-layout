@@ -286,6 +286,37 @@ gives plugin toasts no severity, allows only one at a time, and rate-limits them
 Every diagnostic also goes to stderr, which is what
 `herdr plugin log list --plugin mikebronner.agentic-panes-layout` keeps.
 
+### Check which version is actually running
+
+```sh
+bin/agent-layout --version
+```
+
+```
+agent-layout 0.3.0 (67f7c27, built 2026-09-10T17:09:29Z)
+manifest 0.3.0 at /path/to/herdr-plugin.toml
+```
+
+Three facts, because no one of them is enough. The **commit** is what catches a binary
+built before your last change, which a version number cannot: this repository moves the
+version only on a release commit, so a stale binary and a current manifest read the same
+number. The **build time** says at a glance whether it predates your last edit. The
+**manifest version** is read from disk at run time and is what Herdr itself reads, so
+comparing it against the compiled-in crate version catches staleness across a release
+even when git is unavailable.
+
+When those two disagree it says so outright:
+
+```
+STALE: this binary is 0.3.0 but the manifest is 0.3.1. Rebuild it with `cargo build --release`.
+```
+
+A commit reading `unknown` means the build had no git or no repository, which is normal
+for a source tarball. A commit marked `-dirty` was built from uncommitted changes, so the
+hash alone would misrepresent what was compiled. Nothing here can fail: every lookup
+degrades to a word, because this is the command you reach for when everything else is
+broken.
+
 ### Check a config before you rely on it
 
 ```sh

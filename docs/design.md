@@ -188,6 +188,65 @@ Sending the text without the Enter would leave the command sitting unexecuted at
 the prompt, which looks identical in a screenshot. There is a test pinning both
 halves.
 
+## `--version`, and why three facts rather than one
+
+A running binary was found **two commits behind its source**: built at 08:36 while the
+last commit was 09:59, with three source files newer than the artifact. The manifest
+Herdr held was current, including `startup` and both panes, so the busy-pane retry and
+the `worktree.opened` layout were registered and not actually running. Diagnosing it took
+three commands and an inference.
+
+A crate version alone would not have caught it. Under this repository's convention the
+version moves **only on a release commit**, so the stale binary and the current manifest
+both read 0.3.0. Three facts are reported because each catches something the others
+cannot:
+
+| Fact | Catches |
+| --- | --- |
+| Crate version, compiled in | Which release the binary belongs to |
+| Git commit, compiled in | A binary behind its source **within** a release |
+| Build time, compiled in | Whether the artifact predates the last edit |
+| Manifest version, read at run time | Staleness **across** a release, with no git involved |
+
+The manifest line was not in the original design and is a real addition rather than a
+duplicate. `CARGO_PKG_VERSION` is baked in at **compile** time; the manifest is read from
+disk at **run** time, and it is the file Herdr itself reads to decide what this plugin is.
+So one says what you are running and the other says what Herdr thinks you have. After the
+next release commit, a stale binary reports the old number against a manifest holding the
+new one — caught **without git**, which matters because the commit is exactly what goes
+missing when git does.
+
+When the two disagree the output says `STALE` and names the fix. Printing two numbers and
+leaving the reader to compare them invites a bug report rather than a diagnosis.
+
+### Nothing in it can fail
+
+Every lookup degrades to a word: `unknown` for the commit, `manifest unknown` when the
+file is missing or unparseable. This is the command reached for when everything else is
+broken, so one that errored because it could not find its own manifest would be worse
+than one that says less.
+
+The build script holds the same rule. Git may be absent, and the plugin root may not be a
+repository at all: `herdr plugin install` clones, but a source tarball would not. Herdr
+reports build failures and installs no toolchains, so failing a build for a diagnostic
+string would be a bad trade. **Verified by building a copy of this crate outside any
+repository**: it compiled and reported `unknown`.
+
+### Two decisions worth recording
+
+**A dirty tree is marked.** Not asked for, and included because it is the case a bare
+hash silently misrepresents: a binary built from uncommitted changes reports a commit
+whose source is not what was compiled. That is the same class of failure as the stale
+binary this exists to catch, so hiding it would undercut the point. A `status` that
+itself fails reads `-unverified` rather than being claimed as clean.
+
+**Both the sources and the git head are watched for rebuilds.** Neither cargo default is
+right. With no `cargo:rerun-if-changed` at all, the script reruns on a package change and
+would miss a commit made with no file edits, embedding a stale commit — a poor joke given
+what this is for. With only the git paths, a source edit would not rerun it and the build
+time would predate the binary beside it. Watching `src` and `.git/HEAD` plus the ref it
+points at costs two short commands per rebuild and leaves neither field able to go stale.
+
 ## The Herdr version floor
 
 `min_herdr_version` is **0.8.2**, unchanged by the rewrite.

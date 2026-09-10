@@ -24,6 +24,7 @@ struct Args {
     rebuild: bool,
     check: bool,
     issues: bool,
+    version: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -35,6 +36,7 @@ fn parse_args() -> Result<Args, String> {
         rebuild: false,
         check: false,
         issues: false,
+        version: false,
     };
     let mut raw = std::env::args().skip(1);
     while let Some(flag) = raw.next() {
@@ -69,6 +71,12 @@ fn parse_args() -> Result<Args, String> {
                 }
                 args.issues = true;
             }
+            "--version" | "-V" => {
+                if args.version {
+                    return Err("--version given more than once".to_string());
+                }
+                args.version = true;
+            }
             "--workspace" => {
                 if args.workspace.is_some() {
                     return Err("--workspace given more than once".to_string());
@@ -94,6 +102,80 @@ fn value(given: Option<String>, complaint: &str) -> Result<String, String> {
     }
 }
 
+/// What this binary is, and whether it matches the manifest Herdr reads.
+///
+/// The crate version alone would not have caught the failure this exists for: a binary
+/// two commits behind its source, where the stale artifact and the current manifest both
+/// read 0.3.0, because the version only moves on a release commit. **The commit is what
+/// distinguishes them within a release**, and the build time says at a glance whether it
+/// predates the last edit.
+///
+/// The manifest version is reported too, and it is a genuinely different fact.
+/// `CARGO_PKG_VERSION` is baked in at **compile** time; the manifest is read from disk at
+/// **run** time, and it is what Herdr itself reads to decide what this plugin is. So one
+/// is "what you are running" and the other is "what Herdr thinks you have". After a
+/// release commit, a stale binary reports the old number against a manifest holding the
+/// new one, and that is caught **with no git involved** — which matters because the
+/// commit is exactly what goes missing when git does.
+///
+/// **Nothing here can fail.** Every lookup degrades to a word. A `--version` that errored
+/// because it could not find its own manifest would be worse than one that says less, and
+/// this is the command that has to work when everything else is broken.
+fn version_line() -> String {
+    let crate_version = env!("CARGO_PKG_VERSION");
+    let mut lines = vec![format!(
+        "agent-layout {} ({}, built {})",
+        crate_version,
+        env!("AGENT_LAYOUT_COMMIT"),
+        env!("AGENT_LAYOUT_BUILT_AT")
+    )];
+
+    match manifest_version() {
+        Some((version, path)) => {
+            lines.push(format!("manifest {} at {}", version, path.display()));
+            // Said outright rather than left as two numbers to compare. "0.3.0 / 0.3.1"
+            // with no explanation invites a bug report instead of a diagnosis.
+            if version != crate_version {
+                lines.push(format!(
+                    "STALE: this binary is {} but the manifest is {}. \
+                     Rebuild it with `cargo build --release`.",
+                    crate_version, version
+                ));
+            }
+        }
+        None => lines.push("manifest unknown, so staleness cannot be checked".to_string()),
+    }
+
+    lines.join("\n")
+}
+
+/// The `version` key from `herdr-plugin.toml`, and where it was read from.
+///
+/// Resolved from the executable's own location rather than only from
+/// `HERDR_PLUGIN_ROOT`, because `--version` is typed by hand far more often than it is
+/// invoked by Herdr, and by hand that variable is not set.
+fn manifest_version() -> Option<(String, std::path::PathBuf)> {
+    let root = match std::env::var_os("HERDR_PLUGIN_ROOT") {
+        Some(root) if !root.is_empty() => std::path::PathBuf::from(root),
+        // <root>/target/<profile>/agent-layout
+        _ => std::env::current_exe()
+            .ok()?
+            .parent()?
+            .parent()?
+            .parent()?
+            .to_path_buf(),
+    };
+    let path = root.join("herdr-plugin.toml");
+    let version = std::fs::read_to_string(&path)
+        .ok()?
+        .parse::<toml::Table>()
+        .ok()?
+        .get("version")?
+        .as_str()?
+        .to_string();
+    Some((version, path))
+}
+
 fn event_workspace_is_focused() -> bool {
     let raw = match std::env::var(EVENT_JSON_VAR) {
         Ok(raw) if !raw.is_empty() => raw,
@@ -113,6 +195,13 @@ fn event_workspace_is_focused() -> bool {
 
 fn run() -> Result<(), Exit> {
     let args = parse_args().map_err(Exit)?;
+
+    // First of all, because the question it answers is "what is this?" and that must be
+    // answerable when everything else is broken. It reads nothing and reaches nothing.
+    if args.version {
+        println!("{}", version_line());
+        return Ok(());
+    }
 
     // The popup pane runs this same binary. It talks to a terminal and a file, not
     // to the socket, so it returns before anything else is resolved.
