@@ -337,6 +337,6 @@ agent = "codex"
     run(&stub, &[], Some(root.as_path()));
     assert_eq!(
         stub.params_for("agent.start"),
-        vec![json!({"name": "proj-one", "kind": "codex", "pane_id": "p2"})]
+        vec![json!({"name": "proj-one", "kind": "codex", "pane_id": "t2p2"})]
     );
 }

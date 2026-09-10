@@ -9,15 +9,18 @@
 //! guard; a bare invocation, which is what the documented `[[keys.command]]`
 //! binding sends, means rebuild. Mike's own config therefore needs no edit.
 //!
-//! A rebuild closes panes, and a pane running an agent holds work that cannot be
-//! recovered, so that case asks first and every failure answers no.
+//! **A rebuild replaces the whole tab in one `layout.apply`.** There is no pane-by-pane
+//! close and no survivor: a `tab_id` destroys every pane in that tab and builds the
+//! configured tree in its place. So a tab running an agent holds work that cannot be
+//! recovered, that case asks first, and every non-affirmative answer leaves the tab
+//! exactly as it was.
 
 mod support;
 
 use serde_json::json;
 use support::*;
 
-/// A one-pane layout, so a rebuild's pane arithmetic is easy to read.
+/// A one-pane layout, so a rebuild's arithmetic is easy to read.
 fn solo_config(dir: &TempDir) -> std::path::PathBuf {
     config_root_with(
         dir,
@@ -48,13 +51,6 @@ fn existing_tab_with_an_agent() -> Script {
              "agent": "claude"}]}),
         ..Script::default()
     }
-}
-
-fn closed(stub: &Stub) -> Vec<String> {
-    stub.params_for("pane.close")
-        .iter()
-        .filter_map(|p| p.get("pane_id")?.as_str().map(|s| s.to_string()))
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -118,7 +114,8 @@ fn a_rebuild_needs_no_change_to_the_documented_keybinding() {
 
 #[test]
 fn a_rebuild_still_creates_a_tab_the_layout_names_but_the_workspace_lacks() {
-    // Rebuilding is about existing tabs. A missing one is still just built.
+    // Rebuilding is about existing tabs. A missing one is still just built, and the
+    // two cases take different targets: replacing one tab, adding another.
     let dir = TempDir::new();
     let root = config_root_with(
         &dir,
@@ -134,9 +131,11 @@ fn a_rebuild_still_creates_a_tab_the_layout_names_but_the_workspace_lacks() {
     assert!(run.says("rebuilt agent"), "{}", run.stderr);
     assert!(run.says("laid out notes"), "{}", run.stderr);
     assert_eq!(
-        stub.params_for("tab.create")[0]["label"],
-        json!("notes"),
-        "the missing tab was not created"
+        stub.applies(),
+        vec![
+            (Applied::Replace("t1".into()), "agent".to_string()),
+            (Applied::Add("w9".into()), "notes".to_string()),
+        ]
     );
 }
 
@@ -145,9 +144,9 @@ fn a_rebuild_still_creates_a_tab_the_layout_names_but_the_workspace_lacks() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn rebuilding_a_plain_tab_closes_the_extra_panes_and_asks_nothing() {
-    // No agent means no unrecoverable work, so no popup. The first pane survives
-    // because a tab must keep one, and the rest go.
+fn rebuilding_a_plain_tab_replaces_it_and_asks_nothing() {
+    // No agent means no unrecoverable work, so no popup. The tab is replaced whole,
+    // which is what `layout.apply` with a `tab_id` does.
     let dir = TempDir::new();
     let root = solo_config(&dir);
     let stub = Stub::start(existing_plain_tab());
@@ -157,39 +156,72 @@ fn rebuilding_a_plain_tab_closes_the_extra_panes_and_asks_nothing() {
         stub.params_for("plugin.pane.open").is_empty(),
         "a plain rebuild must not ask anything"
     );
-    assert_eq!(closed(&stub), vec!["p2"]);
+    assert_eq!(
+        stub.applies(),
+        vec![(Applied::Replace("t1".into()), "agent".to_string())]
+    );
+}
+
+#[test]
+fn a_rebuild_closes_no_pane_by_hand() {
+    // The old engine closed the extra panes one at a time and kept a survivor to split
+    // from. Replacing the tab destroys them all at once, so a stray `pane.close` here
+    // would be a leftover of that engine acting on ids that no longer exist.
+    let dir = TempDir::new();
+    let root = solo_config(&dir);
+    let stub = Stub::start(existing_plain_tab());
+    run(&stub, &[], Some(root.as_path()));
+    assert!(
+        stub.params_for("pane.close").is_empty(),
+        "{:?}",
+        stub.params_for("pane.close")
+    );
+    assert!(
+        stub.params_for("pane.split").is_empty(),
+        "{:?}",
+        stub.params_for("pane.split")
+    );
 }
 
 #[test]
 fn a_rebuilt_tab_is_relabelled_and_gets_its_agent() {
+    // The panes are new ones the apply made, so the label and the agent go to the ids
+    // it answered with, not to the ids that were there before.
     let dir = TempDir::new();
     let root = solo_config(&dir);
     let stub = Stub::start(existing_plain_tab());
     run(&stub, &[], Some(root.as_path()));
     assert_eq!(
         stub.params_for("pane.rename"),
-        vec![json!({"pane_id": "p1", "label": "agent"})]
+        vec![json!({"pane_id": "t2p1", "label": "agent"})]
     );
     assert_eq!(
         stub.params_for("agent.start"),
-        vec![json!({"name": "proj-one", "kind": "claude", "pane_id": "p1"})]
+        vec![json!({"name": "proj-one", "kind": "claude", "pane_id": "t2p1"})]
     );
 }
 
 #[test]
 fn a_rebuild_does_not_rename_the_tab_it_is_rebuilding() {
-    // The tab already carries the layout's name, which is how it was found. Renaming
-    // it again is a wasted call, and taking over the active tab would be wrong.
+    // The tab already carries the layout's name, which is how it was found, and the
+    // replacement carries the name again in `tab_label`. A `tab.rename` on top of that
+    // would be a wasted call against a tab id the apply has already retired.
     let dir = TempDir::new();
     let root = solo_config(&dir);
     let stub = Stub::start(existing_plain_tab());
     run(&stub, &[], Some(root.as_path()));
     assert!(stub.params_for("tab.rename").is_empty());
     assert!(stub.params_for("tab.create").is_empty());
+    assert_eq!(
+        stub.params_for("layout.apply")[0]["tab_label"],
+        json!("agent")
+    );
 }
 
 #[test]
-fn a_rebuild_splits_from_the_surviving_pane() {
+fn a_rebuild_builds_every_pane_of_the_tab_in_the_one_call() {
+    // The split lives in the tree now, so a two-pane tab is still one round trip. The
+    // direction and ratio are the ones configured for the pane being created.
     let dir = TempDir::new();
     let root = config_root_with(
         &dir,
@@ -200,15 +232,31 @@ fn a_rebuild_splits_from_the_surviving_pane() {
     );
     let stub = Stub::start(existing_plain_tab());
     run(&stub, &[], Some(root.as_path()));
-    let splits = stub.params_for("pane.split");
-    assert_eq!(splits.len(), 1);
-    assert_eq!(splits[0]["target_pane_id"], json!("p1"));
+
+    let applied = stub.params_for("layout.apply");
+    assert_eq!(applied.len(), 1, "one call builds the whole tab");
+    let root_node = &applied[0]["root"];
+    assert_eq!(root_node["type"], json!("split"));
+    assert_eq!(root_node["direction"], json!("right"));
+    assert_eq!(root_node["ratio"], json!(0.5));
+    assert_eq!(root_node["first"]["type"], json!("pane"));
+    assert_eq!(root_node["second"]["type"], json!("pane"));
+
+    // And the two panes it made are the ones the agent and the command land in.
+    assert_eq!(stub.params_for("agent.start")[0]["pane_id"], json!("t2p1"));
+    assert_eq!(
+        stub.params_for("pane.send_input")[0]["pane_id"],
+        json!("t2p2")
+    );
 }
 
 #[test]
-fn panes_of_another_tab_are_not_closed_by_a_rebuild() {
-    // A rebuild is scoped to the tab being rebuilt. Closing a sibling tab's panes
-    // would destroy work in a tab the layout never mentioned.
+fn panes_of_another_tab_are_not_destroyed_by_a_rebuild() {
+    // **This pins a decision Mike made, not an incidental limit.** His words: only
+    // destroy the tabs named in the layout. He took it after being shown the
+    // consequence of a wider scope, which is that one keypress would destroy an
+    // unrelated tab. So a future reader should not treat this as a limitation to lift:
+    // a tab the layout never mentions survives every rebuild, by choice.
     let dir = TempDir::new();
     let root = solo_config(&dir);
     let stub = Stub::start(Script {
@@ -220,7 +268,11 @@ fn panes_of_another_tab_are_not_closed_by_a_rebuild() {
         ..Script::default()
     });
     run(&stub, &[], Some(root.as_path()));
-    assert_eq!(closed(&stub), vec!["p2"]);
+    assert_eq!(
+        stub.applies(),
+        vec![(Applied::Replace("t1".into()), "agent".to_string())],
+        "only the tab the layout names may be replaced"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -250,7 +302,7 @@ fn the_question_names_the_pane_and_the_agent_and_warns_about_the_work() {
     // the point of asking at all is that the work is unrecoverable.
     let dir = TempDir::new();
     let root = solo_config(&dir);
-    let stub = Stub::start(existing_tab_with_an_agent().answers("keep"));
+    let stub = Stub::start(existing_tab_with_an_agent().answers("nothing"));
     run(&stub, &[], Some(root.as_path()));
     let question = stub.params_for("plugin.pane.open")[0]["env"]["AGENT_LAYOUT_QUESTION"]
         .as_str()
@@ -262,199 +314,28 @@ fn the_question_names_the_pane_and_the_agent_and_warns_about_the_work() {
 }
 
 #[test]
-fn an_affirmative_answer_closes_the_agent_pane_and_rebuilds_clean() {
+fn an_affirmative_answer_replaces_the_tab_and_rebuilds_clean() {
     let dir = TempDir::new();
     let root = solo_config(&dir);
     let stub = Stub::start(existing_tab_with_an_agent().answers("close"));
     let run = run(&stub, &[], Some(root.as_path()));
     assert_eq!(run.status, 0, "{}", run.stderr);
-    assert_eq!(closed(&stub), vec!["p2"], "the agent pane must be closed");
-    // Rebuilt clean: the survivor gets the layout's label and a fresh agent.
+    assert_eq!(
+        stub.applies(),
+        vec![(Applied::Replace("t1".into()), "agent".to_string())],
+        "the tab holding the agent must be replaced"
+    );
+    // Rebuilt clean: the new pane gets the layout's label and a fresh agent.
     assert_eq!(
         stub.params_for("agent.start"),
-        vec![json!({"name": "proj-one", "kind": "claude", "pane_id": "p1"})]
+        vec![json!({"name": "proj-one", "kind": "claude", "pane_id": "t2p1"})]
     );
 }
 
 #[test]
-fn a_refusal_leaves_the_agent_running_and_closes_nothing_of_its_own() {
-    let dir = TempDir::new();
-    let root = solo_config(&dir);
-    let stub = Stub::start(existing_tab_with_an_agent().answers("keep"));
-    let run = run(&stub, &[], Some(root.as_path()));
-    assert_eq!(run.status, 0, "{}", run.stderr);
-    assert!(
-        !closed(&stub).contains(&"p2".to_string()),
-        "the agent pane must survive a refusal: {:?}",
-        closed(&stub)
-    );
-}
-
-#[test]
-fn a_refusal_still_produces_the_configured_layout_around_the_survivor() {
-    // Mike's words were that it should work around it. Aborting the run would leave
-    // the user with neither the old layout nor the new one.
-    let dir = TempDir::new();
-    let root = config_root_with(
-        &dir,
-        "default = \"three\"\n\
-         [[layouts.three.tabs]]\nname = \"agent\"\n\
-         [[layouts.three.tabs.panes]]\nagent = \"claude\"\nlabel = \"agent\"\n\
-         [[layouts.three.tabs.panes]]\nsplit = \"right\"\nratio = 0.5\n\
-         command = \"lazygit\"\nlabel = \"lazygit\"\n\
-         [[layouts.three.tabs.panes]]\nsplit = \"down\"\nratio = 0.6\nlabel = \"shell\"\n",
-    );
-    let stub = Stub::start(existing_tab_with_an_agent().answers("keep"));
-    let run = run(&stub, &[], Some(root.as_path()));
-    assert_eq!(run.status, 0, "{}", run.stderr);
-
-    // The survivor is the agent's own pane, and the layout is built outward from it.
-    let splits = stub.params_for("pane.split");
-    assert_eq!(splits.len(), 2);
-    assert_eq!(splits[0]["target_pane_id"], json!("p2"));
-
-    // It is relabelled as the layout's agent pane, which is what was asked for.
-    assert_eq!(
-        stub.params_for("pane.rename")[0],
-        json!({"pane_id": "p2", "label": "agent"})
-    );
-    // And the rest of the layout really happened.
-    assert_eq!(stub.params_for("pane.rename").len(), 3);
-    assert_eq!(
-        stub.params_for("pane.send_input")[0]["text"],
-        json!("lazygit")
-    );
-}
-
-#[test]
-fn a_refusal_does_not_start_a_second_agent_in_the_surviving_pane() {
-    // Starting another agent where one is already running is the very thing the
-    // refusal refused.
-    let dir = TempDir::new();
-    let root = solo_config(&dir);
-    let stub = Stub::start(existing_tab_with_an_agent().answers("keep"));
-    let run = run(&stub, &[], Some(root.as_path()));
-    assert!(
-        stub.params_for("agent.start").is_empty(),
-        "{:?}",
-        stub.params_for("agent.start")
-    );
-    assert!(run.says("already runs an agent"), "{}", run.stderr);
-}
-
-#[test]
-fn a_refusal_does_not_type_a_command_into_the_surviving_agents_pane() {
-    // The pane's foreground process is an agent, so text sent to it is a prompt, not
-    // a shell command. That would put words in the agent's mouth.
-    let dir = TempDir::new();
-    let root = config_root_with(
-        &dir,
-        "default = \"one\"\n\
-         [[layouts.one.tabs]]\nname = \"agent\"\n\
-         [[layouts.one.tabs.panes]]\nagent = \"claude\"\ncommand = \"echo hello\"\n",
-    );
-    let stub = Stub::start(existing_tab_with_an_agent().answers("keep"));
-    let run = run(&stub, &[], Some(root.as_path()));
-    assert!(
-        stub.params_for("pane.send_input").is_empty(),
-        "{:?}",
-        stub.params_for("pane.send_input")
-    );
-    assert!(run.says("did not run the command"), "{}", run.stderr);
-}
-
-#[test]
-fn a_refusal_still_closes_the_panes_that_hold_no_agent() {
-    let dir = TempDir::new();
-    let root = solo_config(&dir);
-    let stub = Stub::start(
-        Script {
-            tabs: tabs_labelled(&["agent"]),
-            panes: json!({"panes": [
-            {"pane_id": "p1", "tab_id": "t1", "cwd": "/tmp/proj"},
-            {"pane_id": "p2", "tab_id": "t1", "cwd": "/tmp/proj",
-             "agent": "claude"},
-            {"pane_id": "p3", "tab_id": "t1", "cwd": "/tmp/proj"}]}),
-            ..Script::default()
-        }
-        .answers("keep"),
-    );
-    run(&stub, &[], Some(root.as_path()));
-    let shut = closed(&stub);
-    assert!(shut.contains(&"p1".to_string()), "{:?}", shut);
-    assert!(shut.contains(&"p3".to_string()), "{:?}", shut);
-    assert!(!shut.contains(&"p2".to_string()), "{:?}", shut);
-}
-
-#[test]
-fn a_refusal_spares_every_agent_pane_not_only_the_survivor() {
-    // Found by mutation testing, which is the only reason this is here: deleting the
-    // agent check inside the close loop left all 31 other tests green, because every
-    // one of them had a single agent pane and that pane was the survivor. A tab with
-    // two agents would have had the second one closed after the user said no.
-    let dir = TempDir::new();
-    let root = solo_config(&dir);
-    let stub = Stub::start(
-        Script {
-            tabs: tabs_labelled(&["agent"]),
-            panes: json!({"panes": [
-                {"pane_id": "p1", "tab_id": "t1", "cwd": "/tmp/proj"},
-                {"pane_id": "p2", "tab_id": "t1", "cwd": "/tmp/proj",
-                 "agent": "claude"},
-                {"pane_id": "p3", "tab_id": "t1", "cwd": "/tmp/proj",
-                 "agent": "codex"}]}),
-            ..Script::default()
-        }
-        .answers("keep"),
-    );
-    let run = run(&stub, &[], Some(root.as_path()));
-    assert_eq!(run.status, 0, "{}", run.stderr);
-
-    let shut = closed(&stub);
-    assert!(
-        !shut.contains(&"p2".to_string()),
-        "the survivor was closed: {:?}",
-        shut
-    );
-    assert!(
-        !shut.contains(&"p3".to_string()),
-        "a second agent pane was closed after the user said no: {:?}",
-        shut
-    );
-    assert!(shut.contains(&"p1".to_string()), "{:?}", shut);
-    assert!(run.says("left pane p3 running codex"), "{}", run.stderr);
-}
-
-#[test]
-fn the_question_names_every_agent_pane_when_there_is_more_than_one() {
-    // The user is consenting to destroy all of them, so all of them have to be in
-    // the question. Naming one and closing two would make the answer meaningless.
-    let dir = TempDir::new();
-    let root = solo_config(&dir);
-    let stub = Stub::start(
-        Script {
-            tabs: tabs_labelled(&["agent"]),
-            panes: json!({"panes": [
-                {"pane_id": "p2", "tab_id": "t1", "cwd": "/tmp/proj",
-                 "agent": "claude"},
-                {"pane_id": "p3", "tab_id": "t1", "cwd": "/tmp/proj",
-                 "agent": "codex"}]}),
-            ..Script::default()
-        }
-        .answers("keep"),
-    );
-    run(&stub, &[], Some(root.as_path()));
-    let question = stub.params_for("plugin.pane.open")[0]["env"]["AGENT_LAYOUT_QUESTION"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    assert!(question.contains("2 panes"), "{}", question);
-    assert!(question.contains("p2"), "{}", question);
-    assert!(question.contains("p3"), "{}", question);
-}
-
-#[test]
-fn an_affirmative_answer_closes_every_agent_pane() {
+fn an_affirmative_answer_covers_every_agent_pane_at_once() {
+    // Two agents, one question, one replacement. The old engine closed them one by one
+    // and could get halfway; this cannot, because the tab goes as a unit.
     let dir = TempDir::new();
     let root = solo_config(&dir);
     let stub = Stub::start(
@@ -470,24 +351,55 @@ fn an_affirmative_answer_closes_every_agent_pane() {
         }
         .answers("close"),
     );
+    let run = run(&stub, &[], Some(root.as_path()));
+    assert_eq!(run.status, 0, "{}", run.stderr);
+    assert_eq!(stub.params_for("plugin.pane.open").len(), 1);
+    assert_eq!(
+        stub.applies(),
+        vec![(Applied::Replace("t1".into()), "agent".to_string())]
+    );
+}
+
+#[test]
+fn the_question_names_every_agent_pane_when_there_is_more_than_one() {
+    // The user is consenting to destroy all of them, so all of them have to be in
+    // the question. Naming one and destroying two would make the answer meaningless.
+    let dir = TempDir::new();
+    let root = solo_config(&dir);
+    let stub = Stub::start(
+        Script {
+            tabs: tabs_labelled(&["agent"]),
+            panes: json!({"panes": [
+                {"pane_id": "p2", "tab_id": "t1", "cwd": "/tmp/proj",
+                 "agent": "claude"},
+                {"pane_id": "p3", "tab_id": "t1", "cwd": "/tmp/proj",
+                 "agent": "codex"}]}),
+            ..Script::default()
+        }
+        .answers("nothing"),
+    );
     run(&stub, &[], Some(root.as_path()));
-    let shut = closed(&stub);
-    assert!(shut.contains(&"p2".to_string()), "{:?}", shut);
-    assert!(shut.contains(&"p3".to_string()), "{:?}", shut);
+    let question = stub.params_for("plugin.pane.open")[0]["env"]["AGENT_LAYOUT_QUESTION"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(question.contains("2 panes"), "{}", question);
+    assert!(question.contains("p2"), "{}", question);
+    assert!(question.contains("p3"), "{}", question);
 }
 
 // ---------------------------------------------------------------------------
-// The third choice: change nothing.
+// The second answer: change nothing.
 //
-// `esc` exists so a misfire is free. Without it the cheapest available answer still
-// rearranges every other pane in the tab, so an accidental keypress would cost a
-// rearranged workspace. Every failure to ask or be answered means this one too.
+// There used to be a third, which kept the agent and built the layout around it. The
+// engine cannot express it: a `tab_id` replaces the tab wholesale and `pane_id` on a
+// leaf is output-only, so a running agent cannot be carried into a new tree. Mike
+// dropped the requirement rather than the rewrite. What is left is a single acting
+// answer, and every other outcome meaning the tab is not touched.
 // ---------------------------------------------------------------------------
 
 #[test]
 fn cancelling_changes_nothing_at_all() {
-    // Not even the panes holding no agent, which `keep` would have closed. That is the
-    // whole difference between the two non-destructive answers.
     let dir = TempDir::new();
     let root = solo_config(&dir);
     let stub = Stub::start(
@@ -510,39 +422,64 @@ fn cancelling_changes_nothing_at_all() {
         stub.changing()
     );
     assert!(run.says("cancelled"), "{}", run.stderr);
+    assert!(run.says("left agent untouched"), "{}", run.stderr);
 }
 
 #[test]
-fn cancelling_and_keeping_differ_in_exactly_one_way() {
-    // The pair that pins the distinction. Same fixture, two answers: `keep` closes the
-    // bare pane and rebuilds around the agent, `nothing` leaves the tab as it was.
-    let fixture = || Script {
-        tabs: tabs_labelled(&["agent"]),
-        panes: json!({"panes": [
-            {"pane_id": "p1", "tab_id": "t1", "cwd": "/tmp/proj"},
-            {"pane_id": "p2", "tab_id": "t1", "cwd": "/tmp/proj",
-             "agent": "claude"}]}),
-        ..Script::default()
-    };
+fn a_cancelled_tab_is_not_reported_as_skipped_by_the_guard() {
+    // Two ways to leave a tab alone, and only one of them is the user's own answer.
+    // Reporting a cancelled rebuild as "already there" would name the guard as the
+    // reason and hide the fact that a question was asked and declined.
+    let dir = TempDir::new();
+    let root = solo_config(&dir);
+    let stub = Stub::start(existing_tab_with_an_agent().answers("nothing"));
+    let run = run(&stub, &[], Some(root.as_path()));
+    assert!(!run.says("already there"), "{}", run.stderr);
+}
 
-    let keep_dir = TempDir::new();
-    let keep_root = solo_config(&keep_dir);
-    let keeping = Stub::start(fixture().answers("keep"));
-    run(&keeping, &[], Some(keep_root.as_path()));
-    assert_eq!(
-        closed(&keeping),
-        vec!["p1"],
-        "keep must close the bare pane"
-    );
-
-    let nothing_dir = TempDir::new();
-    let nothing_root = solo_config(&nothing_dir);
-    let cancelling = Stub::start(fixture().answers("nothing"));
-    run(&cancelling, &[], Some(nothing_root.as_path()));
+#[test]
+fn the_answer_that_used_to_keep_the_agent_now_changes_nothing() {
+    // `keep` meant "keep the agent and build around it". Nothing can send it any more,
+    // but a popup left over from an older build could, and the only other answer
+    // destroys the pane it was trying to protect. It must not fall through.
+    let dir = TempDir::new();
+    let root = solo_config(&dir);
+    let stub = Stub::start(existing_tab_with_an_agent().answers("keep"));
+    let run = run(&stub, &[], Some(root.as_path()));
+    assert_eq!(run.status, 0, "{}", run.stderr);
     assert!(
-        closed(&cancelling).is_empty(),
-        "cancelling must close nothing: {:?}",
-        closed(&cancelling)
+        stub.changing().is_empty(),
+        "the retired answer must change nothing: {:?}",
+        stub.changing()
+    );
+}
+
+#[test]
+fn a_tab_with_two_agents_is_left_whole_when_the_answer_is_not_affirmative() {
+    // Mutation testing put the older form of this here: an engine that spared only the
+    // pane it had picked out would close the second agent after the user said no. This
+    // engine cannot half-act, and this is what proves the question covers the tab.
+    let dir = TempDir::new();
+    let root = solo_config(&dir);
+    let stub = Stub::start(
+        Script {
+            tabs: tabs_labelled(&["agent"]),
+            panes: json!({"panes": [
+                {"pane_id": "p1", "tab_id": "t1", "cwd": "/tmp/proj"},
+                {"pane_id": "p2", "tab_id": "t1", "cwd": "/tmp/proj",
+                 "agent": "claude"},
+                {"pane_id": "p3", "tab_id": "t1", "cwd": "/tmp/proj",
+                 "agent": "codex"}]}),
+            ..Script::default()
+        }
+        .answers("nothing"),
+    );
+    let run = run(&stub, &[], Some(root.as_path()));
+    assert_eq!(run.status, 0, "{}", run.stderr);
+    assert!(
+        stub.changing().is_empty(),
+        "no part of the tab may be acted on: {:?}",
+        stub.changing()
     );
 }
 
@@ -562,11 +499,10 @@ fn a_cancelled_tab_does_not_stop_the_other_tabs_of_the_layout() {
     let stub = Stub::start(existing_tab_with_an_agent().answers("nothing"));
     let run = run(&stub, &[], Some(root.as_path()));
     assert_eq!(run.status, 0, "{}", run.stderr);
-    assert!(closed(&stub).is_empty(), "{:?}", closed(&stub));
     assert_eq!(
-        stub.params_for("tab.create")[0]["label"],
-        json!("notes"),
-        "the untouched tab still had to be built"
+        stub.applies(),
+        vec![(Applied::Add("w9".into()), "notes".to_string())],
+        "the tab that was never in question still had to be built"
     );
 }
 
@@ -597,23 +533,19 @@ fn a_rebuild_with_no_agent_at_risk_never_asks_and_never_stalls() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_dismissed_question_closes_nothing_and_says_so() {
+fn a_dismissed_question_changes_nothing_and_says_so() {
     // The stub writes no answer and never lists the popup pane, which is what
     // dismissing it looks like. Silence must never read as consent to destroy an
     // agent's work, and it must not hang for the full timeout either: Herdr may kill
-    // the popup's process outright, so it cannot be relied on to write "no" on its
-    // way out.
+    // the popup's process outright, so it cannot be relied on to write an answer on
+    // its way out.
     let dir = TempDir::new();
     let root = solo_config(&dir);
     let stub = Stub::start(existing_tab_with_an_agent().popup_dismissed());
     let started = std::time::Instant::now();
     let run = run(&stub, &[], Some(root.as_path()));
     assert_eq!(run.status, 0, "{}", run.stderr);
-    assert!(
-        !closed(&stub).contains(&"p2".to_string()),
-        "{:?}",
-        closed(&stub)
-    );
+    assert!(stub.changing().is_empty(), "{:?}", stub.changing());
     assert!(run.says("was dismissed"), "{}", run.stderr);
     assert!(
         started.elapsed() < std::time::Duration::from_secs(15),
@@ -623,7 +555,7 @@ fn a_dismissed_question_closes_nothing_and_says_so() {
 }
 
 #[test]
-fn an_answer_that_is_none_of_the_three_changes_nothing_and_says_so() {
+fn an_answer_that_is_neither_choice_changes_nothing_and_says_so() {
     let dir = TempDir::new();
     let root = solo_config(&dir);
     let stub = Stub::start(existing_tab_with_an_agent().answers("maybe"));
@@ -633,11 +565,11 @@ fn an_answer_that_is_none_of_the_three_changes_nothing_and_says_so() {
         "an unrecognised answer must change nothing at all: {:?}",
         stub.changing()
     );
-    assert!(run.says("none of the three choices"), "{}", run.stderr);
+    assert!(run.says("neither choice"), "{}", run.stderr);
 }
 
 #[test]
-fn a_popup_that_will_not_open_closes_nothing_and_says_so() {
+fn a_popup_that_will_not_open_changes_nothing_and_says_so() {
     let dir = TempDir::new();
     let root = solo_config(&dir);
     let stub = Stub::start(
@@ -648,9 +580,9 @@ fn a_popup_that_will_not_open_closes_nothing_and_says_so() {
     let run = run(&stub, &[], Some(root.as_path()));
     assert_eq!(run.status, 0, "{}", run.stderr);
     assert!(
-        !closed(&stub).contains(&"p2".to_string()),
-        "an unaskable question must not kill an agent: {:?}",
-        closed(&stub)
+        stub.changing().is_empty(),
+        "an unaskable question must not destroy a tab: {:?}",
+        stub.changing()
     );
     assert!(
         run.says("could not open the confirmation popup"),
@@ -686,11 +618,6 @@ fn a_popup_that_never_starts_changes_nothing_and_says_why() {
     let started = std::time::Instant::now();
     let run = run(&stub, &[], Some(root.as_path()));
     assert_eq!(run.status, 0, "{}", run.stderr);
-    assert!(
-        !closed(&stub).contains(&"p2".to_string()),
-        "{:?}",
-        closed(&stub)
-    );
     assert!(run.says("never started"), "{}", run.stderr);
     assert!(
         stub.changing().is_empty(),
@@ -705,22 +632,10 @@ fn a_popup_that_never_starts_changes_nothing_and_says_why() {
 }
 
 #[test]
-fn a_failed_pane_close_is_reported_and_the_rebuild_continues() {
-    // Once a rebuild has started, abandoning it leaves the worst of both layouts.
-    let dir = TempDir::new();
-    let root = solo_config(&dir);
-    let stub = Stub::start(existing_plain_tab().failing("pane.close", "pane_not_found"));
-    let run = run(&stub, &[], Some(root.as_path()));
-    assert_eq!(run.status, 0, "{}", run.stderr);
-    assert!(run.says("could not close pane p2"), "{}", run.stderr);
-    assert_eq!(stub.params_for("agent.start").len(), 1);
-}
-
-#[test]
-fn a_tab_that_reports_no_panes_is_left_alone_rather_than_rebuilt() {
-    // Fail closed on a shape that should not happen. With no pane to survive there
-    // is nothing to build from, and inventing one would mean creating a second tab
-    // of the same name.
+fn a_tab_that_reports_no_panes_is_rebuilt_like_any_other() {
+    // It used to be left alone, because the old engine needed a pane to survive and
+    // split from. This one builds the tree from nothing, so an empty tab is simply the
+    // easiest case: nothing is at risk in it, so it is not even a question.
     let dir = TempDir::new();
     let root = solo_config(&dir);
     // The active tab t1 holds a pane, so the working directory still resolves; the
@@ -735,9 +650,12 @@ fn a_tab_that_reports_no_panes_is_left_alone_rather_than_rebuilt() {
     });
     let run = run(&stub, &[], Some(root.as_path()));
     assert_eq!(run.status, 0, "{}", run.stderr);
-    assert!(run.says("reports no panes"), "{}", run.stderr);
-    assert!(stub.params_for("pane.close").is_empty());
-    assert!(stub.params_for("tab.create").is_empty());
+    assert!(stub.params_for("plugin.pane.open").is_empty());
+    assert_eq!(
+        stub.applies(),
+        vec![(Applied::Replace("t2".into()), "agent".to_string())],
+        "the empty tab is the one replaced, not the active one"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -798,19 +716,24 @@ fn the_popup_writes_close_only_for_an_explicit_yes() {
 }
 
 #[test]
-fn the_popup_writes_keep_only_for_an_explicit_no() {
-    for typed in ["n\n", "N\n", "no\n", "NO\n"] {
-        let (answer, _) = ask_popup(typed, &[]);
-        assert_eq!(answer, "keep", "typed {:?}", typed);
-    }
-}
-
-#[test]
 fn the_popup_writes_nothing_for_everything_else() {
-    // Including a bare Enter and end of input, which is what closing the popup
-    // produces. Neither of the two acting answers may be reached by accident: one
-    // destroys an agent's work and the other rearranges the tab.
-    for typed in ["\n", "maybe\n", "", "yes please\n", " \n", "q\n", "esc\n"] {
+    // Including a bare Enter, end of input, and the word that used to mean the third
+    // answer. The one acting answer destroys a tab that may be running an agent, so it
+    // must not be reachable by accident.
+    for typed in [
+        "\n",
+        "n\n",
+        "N\n",
+        "no\n",
+        "NO\n",
+        "keep\n",
+        "maybe\n",
+        "",
+        "yes please\n",
+        " \n",
+        "q\n",
+        "esc\n",
+    ] {
         let (answer, _) = ask_popup(typed, &[]);
         assert_eq!(answer, "nothing", "typed {:?}", typed);
     }
@@ -846,7 +769,22 @@ fn the_popup_says_which_way_it_went() {
     let (_, shown) = ask_popup("y\n", &[]);
     assert!(shown.contains("Closing it"), "{}", shown);
     let (_, shown) = ask_popup("n\n", &[]);
-    assert!(shown.contains("Leaving it running"), "{}", shown);
+    assert!(shown.contains("Changing nothing"), "{}", shown);
+}
+
+#[test]
+fn the_popup_offers_two_choices_and_no_more() {
+    // The screen is the whole interface, so an offer it does not honour is a lie. `n`
+    // used to be listed as its own choice; it now means the same as `esc`, and listing
+    // it would promise an outcome the engine cannot produce.
+    let (_, shown) = ask_popup("", &[]);
+    assert!(shown.contains("close it and rebuild the tab"), "{}", shown);
+    assert!(shown.contains("change nothing"), "{}", shown);
+    assert!(
+        !shown.contains("keep"),
+        "the retired third choice is still on screen: {}",
+        shown
+    );
 }
 
 #[test]

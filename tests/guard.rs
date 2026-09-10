@@ -72,17 +72,20 @@ fn a_tab_whose_name_already_exists_is_skipped() {
 }
 
 #[test]
-fn the_first_tab_takes_over_a_free_active_tab_by_renaming_it() {
+fn the_first_tab_takes_over_a_free_active_tab() {
     // A free active tab is one pane and no agent. Taking it over is what makes a
     // freshly created worktree get its layout in the tab the user is looking at,
     // rather than in a second tab beside it.
+    //
+    // Taking over now means REPLACING that tab, because layout.apply with a tab_id
+    // destroys and rebuilds it. The one bare pane that was there is destroyed, which is
+    // why the tab has to be free to qualify.
     let stub = Stub::start(Script::default());
     run(&stub, &[], None);
     assert_eq!(
-        stub.params_for("tab.rename"),
-        vec![json!({"tab_id": "t1", "label": "agent"})]
+        stub.applies(),
+        vec![(Applied::Replace("t1".into()), "agent".to_string())]
     );
-    assert!(stub.params_for("tab.create").is_empty());
 }
 
 #[test]
@@ -98,11 +101,10 @@ fn the_first_tab_is_created_when_the_active_tab_already_has_two_panes() {
     });
     let run = run(&stub, &[], None);
     assert_eq!(run.status, 0, "{}", run.stderr);
-    assert!(stub.params_for("tab.rename").is_empty());
     assert_eq!(
-        stub.params_for("tab.create"),
-        vec![json!({"workspace_id": "w9", "cwd": "/tmp/proj",
-                    "label": "agent", "focus": false})]
+        stub.applies(),
+        vec![(Applied::Add("w9".into()), "agent".to_string())],
+        "a busy active tab must be left alone and a new tab added instead"
     );
 }
 
@@ -116,15 +118,17 @@ fn the_first_tab_is_created_when_the_active_tab_already_runs_an_agent() {
     });
     let run = run(&stub, &[], None);
     assert_eq!(run.status, 0, "{}", run.stderr);
-    assert!(stub.params_for("tab.rename").is_empty());
-    assert_eq!(stub.params_for("tab.create").len(), 1);
+    assert_eq!(
+        stub.applies(),
+        vec![(Applied::Add("w9".into()), "agent".to_string())]
+    );
 }
 
 #[test]
-fn a_created_first_tab_is_split_from_its_own_root_pane() {
-    // The pane ids differ between the two paths: taking over reuses the active
-    // tab's pane, creating one uses the pane tab.create answers with. Splitting
-    // the old pane after creating a new tab would carve up the wrong tab.
+fn a_created_first_tab_uses_the_panes_its_own_apply_made() {
+    // Commands, labels and agents go to ids from the apply response, not to ids the
+    // engine saw beforehand. Using the old active tab's pane would aim them at a tab that
+    // was deliberately left alone.
     let stub = Stub::start(Script {
         panes: json!({"panes": [
             {"pane_id": "p1", "tab_id": "t1", "cwd": "/tmp/proj"},
@@ -132,8 +136,15 @@ fn a_created_first_tab_is_split_from_its_own_root_pane() {
         ..Script::default()
     });
     run(&stub, &[], None);
-    let splits = stub.params_for("pane.split");
-    assert_eq!(splits[0]["target_pane_id"], json!("t2p1"));
+    let started = &stub.params_for("agent.start")[0];
+    assert_eq!(started["pane_id"], json!("t2p1"));
+    assert!(
+        !stub
+            .params_for("agent.start")
+            .iter()
+            .any(|p| p["pane_id"] == json!("p1") || p["pane_id"] == json!("p9")),
+        "no call may target a pane of the tab that was left alone"
+    );
 }
 
 #[test]
@@ -145,8 +156,11 @@ fn a_pane_in_another_tab_does_not_make_the_active_tab_look_busy() {
         ..Script::default()
     });
     run(&stub, &[], None);
-    assert_eq!(stub.params_for("tab.rename").len(), 1);
-    assert!(stub.params_for("tab.create").is_empty());
+    assert_eq!(
+        stub.applies(),
+        vec![(Applied::Replace("t1".into()), "agent".to_string())],
+        "a pane in another tab must not make the active tab look busy"
+    );
 }
 
 #[test]
@@ -157,11 +171,13 @@ fn the_second_tab_is_created_rather_than_taking_anything_over() {
     let stub = Stub::start(Script::default());
     let run = run(&stub, &[], Some(root.as_path()));
     assert_eq!(run.status, 0, "{}", run.stderr);
-    assert_eq!(stub.params_for("tab.rename").len(), 1);
     assert_eq!(
-        stub.params_for("tab.create"),
-        vec![json!({"workspace_id": "w9", "cwd": "/tmp/proj",
-                    "label": "notes", "focus": false})]
+        stub.applies(),
+        vec![
+            (Applied::Replace("t1".into()), "agent".to_string()),
+            (Applied::Add("w9".into()), "notes".to_string()),
+        ],
+        "the first tab takes over the active one, later tabs are added"
     );
 }
 
@@ -176,9 +192,11 @@ fn a_partly_applied_layout_is_resumed_rather_than_refused() {
     });
     let run = on_event(&stub, Some(root.as_path()));
     assert_eq!(run.status, 0, "{}", run.stderr);
-    assert!(stub.params_for("tab.rename").is_empty());
-    assert_eq!(stub.params_for("tab.create").len(), 1);
-    assert_eq!(stub.params_for("tab.create")[0]["label"], json!("notes"));
+    assert_eq!(
+        stub.applies(),
+        vec![(Applied::Add("w9".into()), "notes".to_string())],
+        "only the unfinished tab is built"
+    );
     assert!(run.says("laid out notes"), "{}", run.stderr);
     assert!(run.says("left agent alone"), "{}", run.stderr);
 }
@@ -197,16 +215,12 @@ fn a_fully_applied_layout_changes_nothing_at_all() {
 }
 
 #[test]
-fn a_failed_tab_create_is_fatal_and_names_the_tab() {
+fn a_failed_build_is_fatal_and_names_the_tab() {
     let (_dir, root) = two_tab_config();
-    let stub = Stub::start(Script::default().failing("tab.create", "workspace_not_found"));
+    let stub = Stub::start(Script::default().failing("layout.apply", "layout_apply_failed"));
     let run = run(&stub, &[], Some(root.as_path()));
     assert_eq!(run.status, 1);
-    assert!(
-        run.says("could not create the tab \"notes\""),
-        "{}",
-        run.stderr
-    );
+    assert!(run.says("could not build tab \"agent\""), "{}", run.stderr);
 }
 
 #[test]

@@ -554,6 +554,29 @@ Two further details worth knowing before using it:
 `layout.set_split_ratio` is the third of the family, addressing a split by a `path`
 of booleans from the root.
 
+**`ratio` on a split node is required and not nullable**, unlike `pane.split`'s.
+Measured 2026-09-10 in an isolated server: omitting it answers `invalid_request`
+with `missing field 'ratio'`, and sending `null` answers `invalid type: null,
+expected f32`. So "leave the ratio out and let Herdr choose" is not expressible
+here, and a caller has to send a number.
+
+**The number to send is 0.5**, because that is the one Herdr chooses. Measured the
+same way: a `pane.split` with no `ratio` at all, exported straight back with
+`layout.export`, comes back `"ratio": 0.5`. Substituting 0.5 for an absent config
+ratio therefore reproduces Herdr's own default rather than overriding it.
+
+**`focus` is honoured when a tab is added, and a replacement inherits whatever the tab
+it replaced had.** Measured 2026-09-10, three ways:
+
+- **Adding.** `focus: false` leaves the previously focused tab focused; `focus: true`
+  moves the focus to the new tab. A real request either way.
+- **Replacing the focused tab.** The replacement comes back focused, whatever `focus`
+  says — there is nothing else it could be. Replacing a workspace's only tab is the
+  special case of this, not a rule of its own.
+- **Replacing a tab that was not focused.** The focus does not move. Confirmed end to
+  end against a live server: a workspace with a hand-made tab focused had two other
+  tabs replaced, and the focus stayed on the hand-made one.
+
 ### `notification.show` can succeed and show nothing
 
 ```json

@@ -115,7 +115,7 @@ fn both_flags_together_are_not_a_repeat() {
     assert_eq!(run.status, 0, "{}", run.stderr);
     assert_eq!(
         stub.params_for("agent.start"),
-        vec![json!({"name": "reserved-2", "kind": "claude", "pane_id": "p1"})]
+        vec![json!({"name": "reserved-2", "kind": "claude", "pane_id": "t2p1"})]
     );
 }
 
@@ -148,10 +148,16 @@ fn the_named_workspace_is_laid_out_though_it_is_not_focused() {
         vec![json!({"workspace_id": "w7"})]
     );
     assert_eq!(
-        stub.params_for("tab.rename"),
-        vec![json!({"tab_id": "t7", "label": "agent"})]
+        stub.applies(),
+        vec![(Applied::Replace("t7".into()), "agent".to_string())]
     );
-    assert_eq!(stub.params_for("pane.split")[0]["cwd"], json!("/tmp/other"));
+    // The cwd on every leaf is the named workspace's, not the focused one's. A leaf
+    // that omits it inherits its sibling's rather than the workspace's, which is why
+    // it is set explicitly and worth checking here.
+    assert_eq!(
+        stub.params_for("layout.apply")[0]["root"]["first"]["cwd"],
+        json!("/tmp/other")
+    );
 }
 
 #[test]
@@ -237,7 +243,7 @@ fn a_focused_event_workspace_is_laid_out() {
         &[("HERDR_PLUGIN_EVENT_JSON", &payload(true))],
     );
     assert_eq!(run.status, 0, "{}", run.stderr);
-    assert_eq!(stub.params_for("tab.rename").len(), 1);
+    assert_eq!(stub.applies().len(), 1);
 }
 
 #[test]
@@ -303,12 +309,7 @@ fn an_opened_workspace_is_laid_out_like_a_created_one() {
         &[("HERDR_PLUGIN_EVENT_JSON", &opened)],
     );
     assert_eq!(run.status, 0, "{}", run.stderr);
-    assert_eq!(
-        stub.params_for("tab.rename").len(),
-        1,
-        "{:?}",
-        stub.methods()
-    );
+    assert_eq!(stub.applies().len(), 1, "{:?}", stub.methods());
     assert_eq!(stub.params_for("agent.start").len(), 1);
 }
 
@@ -383,5 +384,5 @@ fn the_gate_applies_only_when_the_flag_is_given() {
         &[("HERDR_PLUGIN_EVENT_JSON", &payload(false))],
     );
     assert_eq!(run.status, 0, "{}", run.stderr);
-    assert_eq!(stub.params_for("tab.rename").len(), 1);
+    assert_eq!(stub.applies().len(), 1);
 }

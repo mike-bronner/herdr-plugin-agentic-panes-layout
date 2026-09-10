@@ -388,6 +388,12 @@ fn summary(
             outcome.skipped.join(", ")
         ));
     }
+    if !outcome.declined.is_empty() {
+        parts.push(format!(
+            "left {} untouched, not confirmed",
+            outcome.declined.join(", ")
+        ));
+    }
     if parts.is_empty() {
         parts.push("nothing to do".to_string());
     }

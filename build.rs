@@ -9,7 +9,7 @@
 //!
 //! Diagnosing it took three commands and an inference. It should take one.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -46,13 +46,16 @@ fn main() {
     // staged in `git status --porcelain` and leaves the output non-empty either way, so
     // the marker cannot flip on a bare `git add`. Verified rather than assumed.
     //
-    // One measured nuance, so nobody re-opens it as a bug. Cargo fingerprints the PARSED
-    // manifest, not its bytes, so an edit to `Cargo.toml` that changes nothing resolved
-    // reruns nothing. Measured: a version bump reran this script and refreshed the
-    // marker, while a whitespace-only edit and an empty added section rebuilt nothing at
-    // all. That is correct for the meaning chosen here. `git status` would call those
-    // edits dirty and the marker will not, because neither changed what was compiled,
-    // and this field describes the artifact rather than the tree.
+    // **`rerun-if-changed` is keyed on mtimes**, so a bare `touch Cargo.toml` reruns this
+    // script and refreshes the timestamp even though nothing resolved changed. Measured
+    // 2026-09-10 against a control: two consecutive builds held the embedded build time
+    // still, and a `touch` moved it.
+    //
+    // An earlier note here claimed the opposite, on the strength of cargo's PACKAGE
+    // fingerprint being computed from the parsed manifest rather than its bytes. That
+    // mechanism is real and it is not this one. It stopped being the mechanism in force
+    // the moment `Cargo.toml` joined BUILD_INPUTS and started feeding these directives,
+    // and the note survived the change describing a path we no longer take.
     for input in BUILD_INPUTS {
         println!("cargo:rerun-if-changed={}", input);
     }
@@ -66,21 +69,56 @@ fn main() {
 
 /// The git files whose change means the commit changed.
 ///
-/// `HEAD` covers a branch switch and a detached checkout. The file `HEAD` points at
-/// covers a commit on the current branch. Neither is required to exist: a source tarball
-/// has no `.git` at all, and cargo ignores a directive naming a missing path.
+/// `HEAD` covers a branch switch and a detached checkout. **`refs` is watched as a whole
+/// directory**, which covers a commit on the current branch, and it is watched as a
+/// directory on purpose.
+///
+/// The obvious version names the one file `HEAD` points at, and it has a hole: `git gc`
+/// packs the refs and deletes `.git/refs/heads/<branch>`. Two things then go wrong at
+/// once, and the second is the expensive one.
+///
+/// **A directive naming a missing path reruns this script on every single build.**
+/// Measured 2026-09-10, correcting an earlier claim here that cargo ignores such a
+/// directive: adding one for a path that does not exist moved the embedded build time on
+/// three consecutive builds, where the control held it still.
+///
+/// And watching the path is what would have to be dropped to fix that — at which point a
+/// later commit writes the loose ref back, nothing is watching for it, and the binary
+/// keeps a hash it was not built from. A stale hash is the failure this whole field
+/// exists to catch, so that trade is not available.
+///
+/// A directory watch closes both. `.git/refs` survives `gc` (the subdirectories stay,
+/// empty), so no directive ever names a missing path, and a loose ref written back after
+/// a `gc` is seen. It costs one extra rerun per `git fetch`, which writes remote refs
+/// underneath; this script runs two short git commands, so that is the cheap side.
+///
+/// `.git/packed-refs` is deliberately not watched. A ref that MOVES is always written
+/// loose — only `gc` and `pack-refs` write that file, and they do not change what HEAD
+/// resolves to.
+///
+/// **Both paths are resolved by git, not built by joining onto a literal `.git`.**
+/// That is for the linked-worktree case, and it is the whole reason a subprocess call
+/// stands where a path join would do.
+///
+/// **In a linked worktree `.git` is a FILE**, and the real git directory is elsewhere.
+/// Measured 2026-09-10 in a worktree of this repository: `.git` is a 90-byte file, so a
+/// bare `Path::new(".git").exists()` says yes, and `.git/HEAD` and `.git/refs` then both
+/// fail to exist. Joining would leave **nothing at all watched**, and a commit would
+/// rerun nothing — a silently stale hash, which is precisely the failure this field
+/// exists to catch, arriving in the checkout layout this plugin is written to serve.
+///
+/// `--git-path` returns `.git/HEAD` and `.git/refs` unchanged in a normal checkout, the
+/// per-worktree `HEAD` in a worktree, and the **shared** `refs` directory — which is
+/// where a worktree's own branch ref lives, so one directory watch still covers a commit
+/// made in either place. Outside a repository it exits 128, so a source tarball watches
+/// nothing rather than naming files that are not there.
 fn git_watch_paths() -> Vec<PathBuf> {
-    let git = Path::new(".git");
-    if !git.exists() {
-        return Vec::new();
-    }
-    let mut paths = vec![git.join("HEAD")];
-    if let Ok(head) = std::fs::read_to_string(git.join("HEAD")) {
-        if let Some(reference) = head.trim().strip_prefix("ref: ") {
-            paths.push(git.join(reference));
-        }
-    }
-    paths
+    ["HEAD", "refs"]
+        .into_iter()
+        .filter_map(|name| git(&["rev-parse", "--git-path", name]))
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .collect()
 }
 
 /// The commit this was built from, or `unknown`.

@@ -90,6 +90,8 @@ pub struct Script {
     /// The popup appears and then dies without answering, which is what closing the
     /// pane does.
     pub popup_dies_unanswered: bool,
+    /// layout.apply answers with this many panes rather than one per leaf.
+    pub apply_panes: Option<usize>,
     /// `agent.start` answers `agent_pane_busy` for this many calls, then behaves
     /// normally. Stands in for a pane whose shell has not reached its prompt yet.
     pub busy_for: u32,
@@ -107,6 +109,7 @@ impl Default for Script {
             fail_split: None,
             popup_answer: None,
             popup_dies_unanswered: false,
+            apply_panes: None,
             busy_for: 0,
         }
     }
@@ -142,6 +145,12 @@ impl Script {
     /// The popup opens and is then closed without an answer.
     pub fn popup_dismissed(mut self) -> Script {
         self.popup_dies_unanswered = true;
+        self
+    }
+
+    /// layout.apply answers with a tree carrying `n` panes, whatever was asked for.
+    pub fn apply_returns_panes(mut self, n: usize) -> Script {
+        self.apply_panes = Some(n);
         self
     }
 
@@ -268,6 +277,30 @@ impl Stub {
             .collect()
     }
 
+    /// Every `layout.apply`, as `(what it targets, the tab label)`.
+    ///
+    /// The engine builds one tab per call. `Replace` means it destroyed and rebuilt that
+    /// tab, which is what a take-over and a rebuild both do. `Add` means it created a new
+    /// tab beside the existing ones.
+    pub fn applies(&self) -> Vec<(Applied, String)> {
+        self.params_for("layout.apply")
+            .iter()
+            .map(|p| {
+                let target = match (p.get("tab_id"), p.get("workspace_id")) {
+                    (Some(t), _) => Applied::Replace(t.as_str().unwrap_or("").to_string()),
+                    (_, Some(w)) => Applied::Add(w.as_str().unwrap_or("").to_string()),
+                    _ => Applied::Neither,
+                };
+                let label = p
+                    .get("tab_label")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                (target, label)
+            })
+            .collect()
+    }
+
     /// Every request that would alter a workspace.
     ///
     /// The read-only calls and the toast are not layout steps, so a refusal is
@@ -285,6 +318,7 @@ impl Stub {
                         | "pane.send_input"
                         | "agent.start"
                         | "pane.close"
+                        | "layout.apply"
                 )
             })
             .collect()
@@ -362,6 +396,30 @@ fn answer_for(
                       "tab": {"tab_id": format!("t{}", n)},
                       "root_pane": {"pane_id": format!("t{}p1", n)}}))
         }
+        "layout.apply" => {
+            // Answers the way the real server does, measured on 0.9.0: the sent tree is
+            // echoed back with a fresh `pane_id` on every leaf, so a caller can map leaf
+            // to pane exactly. A `tab_id` replaces that tab and the id changes; a
+            // `workspace_id` adds one.
+            let n = tabs.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut root = params.get("root").cloned().unwrap_or(json!({}));
+            let mut next = 0;
+            fill_pane_ids(&mut root, n, &mut next);
+            if let Some(want) = script.apply_panes {
+                root = json!({"type": "pane", "pane_id": "t9p1"});
+                let mut chain = root.clone();
+                for i in 2..=want {
+                    chain = json!({"type": "split", "direction": "right", "ratio": 0.5,
+                                   "first": chain,
+                                   "second": {"type": "pane", "pane_id": format!("t9p{}", i)}});
+                }
+                root = chain;
+            }
+            ok(json!({"type": "layout_apply",
+                      "layout": {"workspace_id": "w9",
+                                 "tab_id": format!("t{}", n),
+                                 "root": root}}))
+        }
         "pane.split" => {
             let n = splits.fetch_add(1, Ordering::SeqCst) + 1;
             if script.fail_split == Some(n) {
@@ -436,6 +494,52 @@ fn dead_pid() -> String {
     let mut child = child;
     let _ = child.wait();
     pid.to_string()
+}
+
+/// Stamp a fresh pane id onto every leaf, depth first, as the server does.
+fn fill_pane_ids(node: &mut Value, tab: u32, next: &mut u32) {
+    match node.get("type").and_then(Value::as_str) {
+        Some("pane") => {
+            *next += 1;
+            if let Some(map) = node.as_object_mut() {
+                map.insert("pane_id".to_string(), json!(format!("t{}p{}", tab, next)));
+            }
+        }
+        Some("split") => {
+            for side in ["first", "second"] {
+                if let Some(child) = node.get_mut(side) {
+                    fill_pane_ids(child, tab, next);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// How many pane leaves a `layout.apply` tree carries.
+///
+/// The split count is one less, so this is the pane arithmetic the old suite did with
+/// `pane.split` call counts, read off the tree instead.
+pub fn leaves(node: &Value) -> usize {
+    match node.get("type").and_then(Value::as_str) {
+        Some("pane") => 1,
+        Some("split") => ["first", "second"]
+            .iter()
+            .filter_map(|side| node.get(side))
+            .map(leaves)
+            .sum(),
+        _ => 0,
+    }
+}
+
+/// What a `layout.apply` acted on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Applied {
+    /// Replaced this tab. Every pane in it was destroyed.
+    Replace(String),
+    /// Added a tab to this workspace. Existing tabs untouched.
+    Add(String),
+    Neither,
 }
 
 pub struct Run {

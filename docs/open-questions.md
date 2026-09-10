@@ -100,84 +100,84 @@ disjoint from anything, and the cost argument alone still rules them out.
 
 ---
 
-## Should the layout engine be rewritten on `layout.apply`?
+## RESOLVED: the layout engine is built on `layout.apply`
 
-**Open, and worth doing for most of the engine. Not rejected.**
+**Status: resolved 2026-09-10. Done.** One tab is now one `layout.apply` call. The
+sequential `tab.create` / `tab.rename` / `pane.split` / `pane.close` engine is gone,
+and so is the previous-pane-only split limitation, because a tree nests arbitrarily.
 
-`layout.apply` builds an entire tab from one recursive tree in a single call. This
-plugin instead issues N sequential `pane.split` calls, one `pane.rename` per label,
-and one `pane.send_input` per command. It would also remove the previous-pane-only
-split limitation entirely, because a tree can nest arbitrarily.
+Kept rather than deleted, because one requirement was dropped to get here and a reader
+who does not know that will try to put it back.
 
-It was measured on 0.9.0, 2026-09-09. The findings are recorded in full in
-[`herdr-behaviour.md`](herdr-behaviour.md); in short, with a `tab_id` it replaces the
-tab and the tab id changes, it kills a pane's agent unconditionally, and `pane_id` on
-a pane leaf is output-only.
+### What blocked it, and how the block was removed
 
-### One path of four is blocked, and it is not the common one
-
-Walking the paths this plugin actually has:
+Three of this plugin's four paths were already served. The fourth was not:
 
 | Path | Served by `layout.apply`? |
 | --- | --- |
 | Initial layout on `worktree.created`: a fresh tab, nothing to preserve | **Yes**, in one call. This is the common case. |
 | The `y` answer: destroy the tab and rebuild it clean | **Yes**, in one call. That is precisely what it does. |
 | The `esc` answer: change nothing | Not applicable, no engine needed. |
-| The `n` answer: keep the running agent and build the layout around it | **No.** |
+| The `n` answer: keep the running agent and build the layout around it | **No**, and it cannot be. |
 
-Only the last one is blocked, and the reason is specific: `pane_id` on a pane leaf is
-output-only, so an existing pane cannot be placed into a tree, and the agent's pane is
-exactly what has to be placed.
+The reason was specific and measured: `pane_id` on a pane leaf is output-only, so an
+existing pane cannot be placed into a tree, and the agent's pane is exactly what `n`
+had to place.
 
-**Destructiveness is explicitly not a blocker.** Replacing a tab wholesale is the
-desired behaviour for three of the four paths. It is only a problem for the one that
-must preserve something.
+**Mike removed the blocker by removing the requirement behind it**, on the grounds
+that new panes are being made anyway. `n` is gone as a distinct answer. The
+confirmation now offers two: `y` replaces the tab, and every other outcome — `esc`,
+`n`, a dismissal, a timeout, a popup that would not open, an answer nobody recognises
+— changes nothing at all. `n` is deliberately still bound, to `DO_NOTHING`, so that
+somebody with the old habit does not destroy a pane by pressing it.
 
-Two costs previously recorded here were overstated and are corrected:
+### The deciding question, and what the measurement said
 
-- **A changed `tab_id` is harmless.** Verified in the code rather than assumed: the
-  guard matches on tab **name** (`tab_named` compares `label`), and `tab_id` is used
-  only to select a tab's panes from a list read fresh at the start of each run. No id
-  is cached across runs.
-- **The 180 existing tests being written against the incremental engine is a cost of
-  changing, not an argument against changing.**
+**What does `layout.apply` do with a pane leaf's `command`?** It was the question that
+had to be answered first, and the answer is that the field is unusable here: it execs
+raw argv against the **server's** `PATH`, which under launchd is
+`/usr/bin:/bin:/usr/sbin:/sbin`. A bare `lazygit` would not resolve, and a whole
+command line in one element is looked up as a single executable name.
 
-### The deciding question, which nobody has measured
+So the engine does not use it. **A leaf carries `cwd` and nothing else**, which spawns
+the user's own interactive login shell, and `pane.send_input` types the command into
+that — preserving their `PATH`, their rc files and unquoted flags. `agent.start` goes
+to the same ids, from the same response.
 
-**What does `layout.apply` do with a pane leaf's `command`?**
+`label` is left off leaves for a second measured reason: an empty label on a leaf comes
+back as `null`, indistinguishable from an absent one, and this plugin's labelling
+contract turns on telling those apart. Labels still go through `pane.rename`.
 
-This plugin documents `command` as one line typed into the pane's **already-running
-interactive shell**, which is why unquoted flags work and why the user's shell rc
-setup applies — `lazygit` resolves because the pane's shell has the user's `PATH`. A
-`layout.apply` pane leaf takes an **argv array**. Those are not equivalent.
+### Three more measurements the rewrite needed
 
-Whoever picks this up should measure this first, because it decides whether the
-mismatch is real or imaginary:
+All on 0.9.0, recorded in full in [`herdr-behaviour.md`](herdr-behaviour.md):
 
-1. Does `layout.apply` **exec the argv directly**, or hand it to a shell?
-2. If a shell, is it an **interactive login** shell that sources the user's rc files,
-   or a bare non-interactive one?
+- **`ratio` on a split node is required and not nullable**, unlike `pane.split`'s.
+  Omitting it is `invalid_request`, and `null` is `expected f32`. The config's promise
+  that an absent ratio is not invented is kept in effect by sending **0.5**, which is
+  measurably the number Herdr itself picks.
+- **`focus: false` is a real request when a tab is added** and a no-op when replacing a
+  workspace's only tab, which comes back focused either way.
+- **`layout.export` is the exact inverse.** A tab the old sequential engine built
+  exports as precisely the tree this engine constructs, which is how the flat config's
+  nesting was confirmed rather than assumed.
 
-If it execs argv directly, or spawns a non-interactive shell, then a bare `lazygit`
-would stop resolving and `command = "git log --oneline -20"` would need splitting.
-Wrapping in `sh -c` does not rescue it: that is a fresh non-interactive shell which has
-never sourced the user's rc files. If instead it runs the argv inside an interactive
-shell, the mismatch is cosmetic and a one-element argv carries the line unchanged.
+### What the tab scope is, and why it is not a limitation
 
-`layout.export` is worth using either way: it returns the same tree shape the current
-engine builds, so it is a cheap check that a constructed tree is the shape the server
-understands.
+**Mike's decision, in his words: only destroy the tabs named in the layout.** Taken
+after being shown the consequence of a wider scope, which is that one keypress would
+destroy an unrelated tab. A one-tab layout touches one tab; a tab the layout does not
+name survives every rebuild. `panes_of_another_tab_are_not_destroyed_by_a_rebuild`
+pins it, and it is a chosen boundary rather than a conservative default somebody
+settled on.
 
-### What would unblock the fourth path
+### What would bring the third answer back
 
 `layout.apply` gaining a way to **place an existing pane** into a tree, making
-`pane_id` an input rather than output. That is the load-bearing one: it would turn
-"keep the agent and build around it" from a special case into a normal one, and a
-single call would then serve every path. A way to preserve or refuse on agent-bearing
-panes would do the same job by a different route.
-
-Until then, a rewrite would keep an incremental fallback for that one branch, which
-is a real design question rather than a blocker.
+`pane_id` an input rather than output. That, or a way to preserve or refuse on
+agent-bearing panes, is what "keep the agent and build around it" would need. Nothing
+short of it will do: wrapping, re-splitting and `sh -c` were all considered and none
+of them carries a live agent across.
 
 ---
 

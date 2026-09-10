@@ -231,7 +231,7 @@ fn the_popup_is_opened_after_the_layout_is_built() {
         .iter()
         .position(|m| m == "plugin.pane.open")
         .expect("the popup must be opened");
-    for step in ["tab.rename", "pane.split", "agent.start"] {
+    for step in ["layout.apply", "agent.start"] {
         let last = methods
             .iter()
             .rposition(|m| m == step)

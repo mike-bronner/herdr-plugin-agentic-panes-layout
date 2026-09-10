@@ -109,9 +109,12 @@ emits only `worktree.opened`. See
 [`docs/open-questions.md`](docs/open-questions.md).
 
 It then reads [`agent-layout.toml`](docs/configuration.md), picks a layout for the
-project, and applies it: rename or create each tab, split each pane out of the one
-before it, run each pane's command, label the panes that asked to be labelled, and
-start each pane's agent.
+project, and applies it: **one call builds a whole tab**, panes, splits and all, and
+then each pane's command is typed in, the panes that asked to be labelled are
+labelled, and each pane's agent is started.
+
+Building a tab in one call is what makes it all-or-nothing. A tab arrives whole or
+not at all, so a failure never leaves you half a layout to clean up by hand.
 
 ### It speaks Herdr's socket API, not the CLI
 
@@ -131,37 +134,41 @@ re-applies the configured layout to a tab that is already there rather than skip
 it. The hook is the one that opts into the guard, so nothing you invoke by hand needs
 a flag to get the rebuild.
 
-A rebuild closes the tab's other panes. If one of them is **running an agent**, you
-are asked first, in a popup, and it takes **one keypress**:
+**A rebuild replaces the whole tab**, keeping its name. Every pane in it goes. Only
+the tabs your layout names are touched: a tab it does not mention survives every
+rebuild, so one keypress can never cost you a tab you were working in.
+
+If a pane of that tab is **running an agent**, you are asked first, in a popup, and
+it takes **one keypress**:
 
 | Key | What happens |
 | --- | --- |
-| `y` | Closes the agent's pane and rebuilds the tab clean. |
-| `n` | Keeps the agent running and rebuilds the layout *around* it, relabelled as the layout's first pane. No second agent is started in it, and no `command` is typed into it. |
+| `y` | Replaces the tab, agents and all, and rebuilds it clean. |
 | `esc` | **Changes nothing at all.** |
 
-`esc` exists so a misfire is free. Without it the cheapest answer available still
-rearranges every other pane in the tab, so an accidental keypress would cost you a
-rearranged workspace.
+**Anything that is not `y` means `esc`**: a popup you close, one you ignore, one that
+cannot be opened, an answer nobody recognises. Those are the same class of event as a
+misfire, so they cost nothing, and the run says which one happened rather than going
+quiet. An agent mid-turn holds work that cannot be recovered, so silence never counts
+as consent.
 
-**A popup you close, ignore, or that cannot be opened means `esc`**, not `n`. Those
-are the same class of event as a misfire, so they cost nothing either, and the run
-says which one happened rather than going quiet. An agent mid-turn holds work that
-cannot be recovered, so silence never counts as consent.
+`n` is still bound, and it means `esc`. It used to keep the agent and rebuild the
+layout around it, which this version cannot do — Herdr's layout call replaces a tab
+wholesale and cannot carry a running agent into the new arrangement. It stays bound
+so an old habit changes nothing rather than destroying the pane it was protecting.
 
 A rebuild that touches no agent pane asks nothing at all and simply proceeds.
 
-The first tab is the exception, because it is not created — it takes over the
-workspace's existing tab by being renamed. So it is skipped when a tab of its name
-exists, it takes over the active tab when that tab holds a single pane and no
-agent, and when the active tab is busy it is created as a new tab instead of being
-wrecked.
+The first tab is the exception, because it is not added — it takes over the
+workspace's existing tab. So it is skipped when a tab of its name exists, it takes
+over the active tab when that tab holds a single pane and no agent, and when the
+active tab is busy it is added as a new tab instead of being wrecked.
 
 ### What is fatal and what is not
 
-Opening a tab is fatal on failure, because it happens before any pane of that tab
-exists and leaves things clean for a retry. Splits are fatal, because the next
-step needs the pane id the split returns. Once the panes exist, a failed command
+Building a tab is fatal on failure. It happens in one call that either builds the
+whole tab or leaves nothing behind, so a failure leaves things clean for a retry and
+there is never a half-built tab to untangle. Once the panes exist, a failed command
 or a failed label is reported and the run still succeeds: the guard means no later
 run could finish the job, so reporting a built layout as a failure would help
 nobody.
@@ -280,7 +287,7 @@ Every key on a pane is optional:
 | `agent` | Starts an agent of that kind in the pane. |
 | `command` | One command line, typed into the pane's own shell. Flags work unquoted. |
 | `split` | `right` or `down`. Required on every pane after the first. |
-| `ratio` | The share kept by the pane **being split**. Omit it and Herdr chooses. |
+| `ratio` | The share kept by the pane **being split**. Omit it and you get Herdr's own default of 0.5. |
 | `label` | Renames the pane. **Omit it and no rename happens at all.** |
 
 ### One pane block is one pane, not one split

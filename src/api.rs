@@ -2,7 +2,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 pub const SOCKET_VAR: &str = "HERDR_SOCKET_PATH";
 
@@ -102,16 +102,6 @@ fn string_at(value: &Value, key: &str) -> Option<String> {
     value.get(key)?.as_str().map(|s| s.to_string())
 }
 
-pub fn params(pairs: Vec<(&str, Value)>) -> Value {
-    let mut map = Map::new();
-    for (key, value) in pairs {
-        if !value.is_null() {
-            map.insert(key.to_string(), value);
-        }
-    }
-    Value::Object(map)
-}
-
 #[derive(Debug, Clone)]
 pub struct Workspace {
     pub workspace_id: String,
@@ -198,52 +188,81 @@ pub fn tabs(client: &Client, workspace_id: &str) -> Result<Vec<TabInfo>, CallErr
         .collect())
 }
 
-pub fn tab_rename(client: &Client, tab_id: &str, label: &str) -> Result<(), CallError> {
-    client
-        .call("tab.rename", json!({"tab_id": tab_id, "label": label}))
-        .map(|_| ())
-}
-
-pub fn tab_create(
+/// Build a whole tab from one recursive tree, and answer with the pane ids it made.
+///
+/// `target` decides what happens to the workspace, and the two modes are not variations
+/// of each other. Measured on 0.9.0:
+///
+/// - **`tab_id`** replaces that tab wholesale. The tab id changes, and every pane in it
+///   is destroyed, including one running an agent.
+/// - **`workspace_id`** with no `tab_id` **adds** a tab and leaves existing ones alone.
+///
+/// **Failure is atomic**: a rejected tree leaves no tab behind, so a caller has nothing
+/// to clean up and nothing half-built to report.
+///
+/// Returns the pane ids in the order the leaves appear in the tree. The response echoes
+/// the tree that was sent with `pane_id` filled into each leaf, so the mapping from leaf
+/// to pane is exact rather than positional guesswork.
+pub fn layout_apply(
     client: &Client,
-    workspace_id: &str,
-    cwd: &str,
-    label: &str,
-) -> Result<String, CallError> {
-    let result = client.call(
-        "tab.create",
-        json!({"workspace_id": workspace_id, "cwd": cwd,
-               "label": label, "focus": false}),
-    )?;
-    result
-        .get("root_pane")
-        .and_then(|p| string_at(p, "pane_id"))
+    target: LayoutTarget<'_>,
+    tab_label: &str,
+    root: Value,
+    focus: bool,
+) -> Result<Vec<String>, CallError> {
+    let mut params = match target {
+        LayoutTarget::ReplaceTab(tab_id) => json!({"tab_id": tab_id}),
+        LayoutTarget::AddToWorkspace(workspace_id) => json!({"workspace_id": workspace_id}),
+    };
+    if let Some(map) = params.as_object_mut() {
+        map.insert("root".to_string(), root);
+        map.insert("tab_label".to_string(), json!(tab_label));
+        map.insert("focus".to_string(), json!(focus));
+    }
+
+    let result = client.call("layout.apply", params)?;
+    let root = result
+        .get("layout")
+        .and_then(|l| l.get("root"))
         .ok_or_else(|| {
-            CallError::Transport("tab.create answered without a root pane id".to_string())
-        })
+            CallError::Transport("layout.apply answered without a layout".to_string())
+        })?;
+
+    let mut ids = Vec::new();
+    collect_pane_ids(root, &mut ids);
+    if ids.is_empty() {
+        return Err(CallError::Transport(
+            "layout.apply answered with no pane ids".to_string(),
+        ));
+    }
+    Ok(ids)
 }
 
-pub fn pane_split(
-    client: &Client,
-    target_pane_id: &str,
-    direction: &str,
-    ratio: Option<f64>,
-    cwd: &str,
-) -> Result<String, CallError> {
-    let result = client.call(
-        "pane.split",
-        params(vec![
-            ("target_pane_id", json!(target_pane_id)),
-            ("direction", json!(direction)),
-            ("ratio", ratio.map(|r| json!(r)).unwrap_or(Value::Null)),
-            ("cwd", json!(cwd)),
-            ("focus", json!(false)),
-        ]),
-    )?;
-    result
-        .get("pane")
-        .and_then(|p| string_at(p, "pane_id"))
-        .ok_or_else(|| CallError::Transport("pane.split answered without a pane id".to_string()))
+/// Which tab a `layout.apply` acts on. Named rather than an `Option<&str>`, because the
+/// two modes destroy and create respectively and a caller should have to say which.
+pub enum LayoutTarget<'a> {
+    ReplaceTab(&'a str),
+    AddToWorkspace(&'a str),
+}
+
+/// Leaf pane ids, in the order the leaves appear. Depth first, `first` before `second`,
+/// which is the order the tree was built in.
+fn collect_pane_ids(node: &Value, into: &mut Vec<String>) {
+    match node.get("type").and_then(Value::as_str) {
+        Some("pane") => {
+            if let Some(id) = string_at(node, "pane_id") {
+                into.push(id);
+            }
+        }
+        Some("split") => {
+            for side in ["first", "second"] {
+                if let Some(child) = node.get(side) {
+                    collect_pane_ids(child, into);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 pub fn pane_rename(client: &Client, pane_id: &str, label: &str) -> Result<(), CallError> {

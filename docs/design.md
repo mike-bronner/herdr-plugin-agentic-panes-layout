@@ -273,12 +273,61 @@ reruns on a package change and would miss a commit made with no file edits, embe
 stale commit — a poor joke given what this is for. With only the git paths, a source edit
 would not rerun it and the build time would predate the binary beside it.
 
-One measured nuance, recorded so nobody re-opens it as a bug. Cargo fingerprints the
-**parsed** manifest rather than its bytes, so a `Cargo.toml` edit that changes nothing
-resolved reruns nothing. Measured: a version bump reran the script and refreshed the
-marker, while a whitespace-only edit and an empty added section rebuilt nothing at all.
-That is correct here. `git status` would call those edits dirty and the marker will not,
-because neither changed what was compiled.
+**`rerun-if-changed` is keyed on mtimes**, so a bare `touch Cargo.toml` reruns the script
+and refreshes the build time even though nothing resolved changed. Measured 2026-09-10
+against a control: two consecutive builds held the embedded time still, and a `touch`
+moved it.
+
+This corrects an earlier note here, which said the opposite on the strength of cargo's
+**package** fingerprint being computed from the parsed manifest rather than its bytes.
+That mechanism is real, and it is a different one. It stopped being the mechanism in
+force the moment `Cargo.toml` joined `BUILD_INPUTS`, and the note outlived the change
+that retired it. The failure that creates is worse than a wrong comment: somebody touches
+`Cargo.toml`, watches the marker move, and finds a document telling them it cannot.
+
+**`.git/refs` is watched as a directory, not as the one file `HEAD` points at.** The
+specific-file version has a hole: `git gc` packs the refs and deletes
+`.git/refs/heads/<branch>`. Two things then go wrong, and the second is the expensive
+one. A directive naming a **missing** path reruns the script on every single build —
+measured 2026-09-10, correcting a second claim here that cargo ignores such a directive.
+And dropping the watch to avoid that is not available either, because a later commit
+writes the loose ref back and nothing would be watching for it, leaving a hash the binary
+was not built from.
+
+A directory watch closes both. `.git/refs` survives `gc`, its subdirectories staying
+behind empty, so no directive ever names a missing path; six consecutive builds after a
+`git pack-refs --all` held the build time still, and a loose ref written afterwards moved
+it. The cost is one extra rerun per `git fetch`, which writes remote refs underneath.
+This script runs two short git commands, so that is the cheap side of the trade against a
+stale hash.
+
+`.git/packed-refs` is deliberately not watched. A ref that **moves** is always written
+loose; only `gc` and `pack-refs` write that file, and neither changes what `HEAD`
+resolves to.
+
+**Both paths are resolved with `git rev-parse --git-path`, not built by joining onto a
+literal `.git`, and that is for the linked-worktree case specifically.** The next reader
+sees a subprocess call where a path join would do, so the reason has to be written down.
+
+**In a linked worktree `.git` is a file**, and the real git directory is elsewhere.
+Measured 2026-09-10 in a worktree of this repository: `.git` is a 90-byte file, so a bare
+`Path::new(".git").exists()` says yes and both joined paths then fail to exist. The
+existence filter above would leave **nothing at all watched**, and a commit would rerun
+nothing — a silently stale hash, in the checkout layout this plugin exists to serve.
+Worse than the every-build rerun the filter was added to prevent, because that one is
+visible and this one is not.
+
+`--git-path` returns `.git/HEAD` and `.git/refs` unchanged in a normal checkout. In a
+worktree it returns the per-worktree `HEAD` and the **shared** `refs` directory, which is
+where a worktree's own branch ref lives — so one directory watch covers a commit made in
+either place. Measured end to end: three builds in a worktree held the stamp still, and a
+commit made inside it moved both the stamp and the embedded hash. Outside a repository
+`git rev-parse` exits 128, so a source tarball watches nothing rather than naming files
+that are not there.
+
+Cargo recurses into a watched directory — a content edit and a file addition two levels
+down each moved the stamp, against a control that held still. Measured on cargo 1.97.0,
+which is the version in use here.
 
 `.git/index` is deliberately not watched. Staging a file moves it from unstaged to staged
 in `git status --porcelain` and leaves the output non-empty either way, so the marker
@@ -289,10 +338,10 @@ cannot flip on a bare `git add`. Verified rather than assumed.
 `min_herdr_version` is **0.8.2**, unchanged by the rewrite.
 
 Every method this plugin sends exists at **protocol 20**, which is Herdr 0.8.2:
-`workspace.list`, `pane.list`, `tab.list`, `tab.create`, `tab.rename`,
-`pane.split`, `pane.rename`, `pane.send_input`, `agent.start`,
-`notification.show`. `herdr tab create` was separately confirmed to exist at
-v0.8.2 with identical flags.
+`workspace.list`, `pane.list`, `tab.list`, `layout.apply`, `pane.rename`,
+`pane.send_input`, `agent.start`, `plugin.pane.open`, `notification.show`.
+`layout.apply` was checked at protocol 20 specifically, because the engine now
+depends on it entirely.
 
 The floor is nonetheless **0.9.0**, to match the one
 `mikebronner.project-finder` declares. That is a consistency decision across two
@@ -396,14 +445,19 @@ The guard is now **per tab, keyed on the tab's name**:
 - A tab whose name already exists in the workspace is **skipped**.
 - Otherwise the tab is created.
 
-The **first** tab is the exception, because it is not created — it takes over the
-workspace's existing tab by being renamed. So:
+The **first** tab is the exception, because it is not added — it takes over the
+workspace's existing tab. So:
 
 | Situation | What happens |
 | --- | --- |
 | A tab of its name already exists | Skipped. |
-| The active tab holds one pane and no agent | **Taken over**, by renaming it. |
-| The active tab is busy | **Created** as a new tab. |
+| The active tab holds one pane and no agent | **Taken over**, by replacing it. |
+| The active tab is busy | **Added** as a new tab. |
+
+Taking over means replacing: `layout.apply` with a `tab_id` destroys the tab and
+builds a new one carrying the same label. The one bare pane that was there does not
+survive, which is exactly why the tab has to be **free** to qualify. A busy active tab
+is never wrecked to save a tab creation.
 
 That third row is the one genuinely new behaviour. v0.2.0 refused the run
 outright. Creating a tab instead is what stops a workspace the user has already
@@ -412,7 +466,7 @@ asked for.
 
 The consequence worth naming: **a run that died halfway is resumed by the next
 one**, because the tabs it finished are skipped and the ones it did not are
-built. That is why a failed `tab.create` on a later tab is still fatal — the work
+built. That is why a failed `layout.apply` on a later tab is still fatal — the work
 is resumable, so an honest non-zero exit costs nothing.
 
 The guard reads the tab list of the workspace **being laid out**, so it guards a
@@ -470,39 +524,50 @@ copy depends on.
 
 ## Rebuilding a tab
 
-A rebuild empties the tab down to one surviving pane and builds the layout from it.
-The survivor is the tab's first pane, unless an agent changes that.
+A rebuild **replaces the whole tab**, in one `layout.apply` carrying its `tab_id`.
+There is no pane-by-pane close and no surviving pane: every pane in that tab is
+destroyed and the configured tree is built in its place, under the same label.
 
-### Closing a pane running an agent needs consent
+The scope of that destruction is **the tabs the layout names, and no others**. That
+is Mike's decision, in his words — *only destroy the tabs named in the layout* —
+taken after being shown the consequence of a wider scope, which is that one keypress
+would destroy an unrelated tab. It is a chosen boundary rather than a conservative
+default, and `panes_of_another_tab_are_not_destroyed_by_a_rebuild` pins it.
+
+### Destroying a pane running an agent needs consent
 
 An agent mid-turn holds work that cannot be recovered, so a rebuild that would
-close one **asks first**, in a popup. There is no force flag: the question is the
-mechanism. It takes **one keypress**, and there are **three** answers.
+destroy one **asks first**, in a popup. There is no force flag: the question is the
+mechanism. It takes **one keypress**, and there are **two** answers.
 
 | Key | Word on the wire | What happens |
 | --- | --- | --- |
-| `y` | `close` | The agent's pane is closed and the tab is rebuilt clean. |
-| `n` | `keep` | The agent's pane becomes the survivor, keeps running, and the tab is rebuilt **around** it. |
+| `y` | `close` | The tab is replaced, agents and all, and rebuilt clean. |
 | `esc` | `nothing` | **Not one pane of the tab is touched.** |
 
-**`esc` is not a synonym for `n`, and that distinction is the point of having it.**
-`n` still closes every non-agent pane in the tab and rebuilds the layout, so without
-a third choice the cheapest available answer costs a rearranged workspace. A misfire
-has to be free.
+There used to be a third. `n` kept the running agent and rebuilt the layout **around**
+it, and it is gone because this engine cannot express it: a `tab_id` replaces the tab
+wholesale, and `pane_id` on a leaf is output-only, so a live agent cannot be carried
+into a new tree. Mike dropped the requirement rather than the rewrite, on the grounds
+that new panes are being made anyway.
 
-Everything that is not one of the three words means `esc`: a dismissed popup, a
-popup that could not be opened, a popup that never started, a timeout, an answer
-nobody recognises. A popup the user closed or ignored is the same class of event as a
+**`n` is still bound, and it now means `esc`.** Somebody with the old habit pressing
+it must change nothing, not destroy the pane they were trying to protect. It is
+deliberately not listed on the popup, because listing it would promise an outcome the
+engine cannot produce.
+
+Everything that is not the one acting word means `esc`: a dismissed popup, a popup
+that could not be opened, a popup that never started, a timeout, an answer nobody
+recognises. A popup the user closed or ignored is the same class of event as a
 misfire, so it costs the same nothing. **Acting on silence is the thing being
 prevented**, and each of those paths says which one happened, because a silent no-op
 after a keypress reads as a broken keybinding.
 
-`n` does not abort the run, because that would leave the user with neither the old
-layout nor the new one. It works around the survivor: the tab is split out from it,
-the other panes are rebuilt, and the survivor is relabelled as the layout's first
-pane. Two things are deliberately **not** done to it — no second agent is started in
-it, and no `command` is typed into it, because its foreground process is an agent and
-text sent there is a prompt rather than a shell command.
+Declining does not abort the run. The tab that was in question is left exactly as it
+was, and the layout's **other** tabs are still built — those were never at risk, and
+abandoning them would make one `esc` cost the whole run. The report distinguishes the
+two ways a tab goes untouched, because "left alone, already there" names the guard and
+"left untouched, not confirmed" names the user's own answer.
 
 **A rebuild that touches no agent pane asks nothing at all.** Nothing is at risk, so
 there is nothing to consent to, and a popup there would make the common case slow for
@@ -511,17 +576,16 @@ danger: the two situations are separated before the question is asked, not after
 
 ### Why one keypress and no ratatui
 
-`crossterm 0.29` reads the key; there is no ratatui. A yes/no/cancel needs no
-widgets, no layout engine and no render loop, and Herdr already draws the pane frame
-and puts the manifest's `title` on it. Three `println!`s and one key is the whole
-interface. The version is pinned to what Herdr's own `Cargo.toml` uses, which keeps
-the property that every crate here is one Herdr already depends on.
+`crossterm 0.29` reads the key; there is no ratatui. A yes/no needs no widgets, no
+layout engine and no render loop, and Herdr already draws the pane frame and puts the
+manifest's `title` on it. Three `println!`s and one key is the whole interface. The
+version is pinned to what Herdr's own `Cargo.toml` uses, which keeps the property that
+every crate here is one Herdr already depends on.
 
 Raw mode needs a tty. The popup always has one, being a real pane; a test harness
 piping stdin does not. Rather than fail there, it falls back to reading a line, which
-keeps the three choices answerable either way — and means the fallback is exercised
-by the suite instead of being untested code that only runs once something has gone
-wrong.
+keeps both choices answerable either way — and means the fallback is exercised by the
+suite instead of being untested code that only runs once something has gone wrong.
 
 ### Why the answer travels through a file, and why the popup reports its own pid
 
@@ -579,25 +643,29 @@ list.
 
 ## Fatal versus non-fatal
 
-The split is deliberate and unchanged in substance from v0.2.0.
+The split is deliberate, and the line falls in the same place it always has: before
+the panes exist, dying is safe; after they exist, it is not.
 
-**Opening a tab is fatal.** A rename or a create happens before any pane of that
-tab exists, so dying there leaves the tab clean for the next run.
-
-**Splits are fatal.** A new pane's id exists only in `pane.split`'s answer, so
-carrying on with nothing would aim the next split and the command at nothing.
+**Building a tab is fatal.** The `layout.apply` that builds it is **atomic** — a
+rejected tree leaves no tab behind — so dying there leaves the workspace exactly as
+the run found it, and the next run builds the tab from scratch.
 
 **A command or a label is not fatal.** Once the panes exist, the guard turns
 every later run into a skip for that tab. Dying there would report a layout that
 was in fact built, and no rerun could ever finish it. A failed command or a failed
 label is therefore reported and the run still succeeds.
 
-One hazard is worth stating plainly, because it is **unchanged rather than
-fixed**: a split that fails leaves a tab carrying the layout's name, so the guard
-skips it forever after and nothing finishes the job by itself. v0.2.0 had exactly
-the same property by a different route, where a half-split tab tripped the
-pane-count guard. Neither version can recover it without the user closing the
-tab.
+**One long-standing hazard is now gone, and it is worth naming as gone.** Under the
+sequential engine a failed `pane.split` left a tab carrying the layout's name and
+half its panes: the guard skipped it forever after, and nothing but the user closing
+the tab could finish the job. v0.2.0 had the same property by a different route.
+Neither could recover. A tab now arrives whole or not at all, so there is no
+half-built state for the guard to freeze.
+
+The response is checked as well as the call. If `layout.apply` answers with a pane
+count that is not the number of leaves sent, the run is fatal and says both numbers
+— applying commands, labels and agents positionally against a tree of a different
+shape would put them in the wrong panes.
 
 **Configuration is never fatal at all.** See the table in
 [`configuration.md`](configuration.md).
@@ -615,26 +683,47 @@ discarded. Read the log back with:
 herdr plugin log list --plugin mikebronner.agentic-panes-layout
 ```
 
-## Splits target the previous pane
+## The flat config nests to the right
 
-Each pane after the first splits the pane before it. That reproduces v0.2.0,
-where the first split divided the arriving pane and the second divided the pane
-the first one made, putting the tool above the shell. Splitting the first pane
-twice would stack three panes down the agent's side instead, and every ratio
-would then apply to the wrong pane.
+The config is a flat list where each pane after the first splits the one before it.
+As a tree that nests to the right: pane 1 against everything else, then pane 2
+against everything after it, and so on. The split's `direction` and `ratio` belong to
+the pane **being created**, and the ratio is the share the pane being split keeps.
 
-There is no way to name an arbitrary pane to split from. Nothing has asked for
-one, and the shape it would need is not obvious.
+That reproduces v0.2.0, where the first split divided the arriving pane and the
+second divided the pane the first one made, putting the tool above the shell.
+Splitting the first pane twice would stack three panes down the agent's side
+instead, and every ratio would then apply to the wrong pane.
 
-### `focus: false` is insurance, not mechanism
+**The mapping was confirmed rather than assumed.** `layout.export` is the exact
+inverse of `layout.apply`, and a tab the old sequential engine had built exports as
+precisely this shape.
+
+A tree could now nest arbitrarily, so the previous-pane-only limitation is a property
+of the **config format** rather than of the engine. Nothing has asked for more, and
+the syntax an arbitrary split target would need is not obvious.
+
+**An absent `ratio` becomes 0.5 on the wire.** A split node's `ratio` is required and
+not nullable, unlike `pane.split`'s, so leaving the choice to Herdr is no longer
+expressible. 0.5 is not a guess at Herdr's default, it **is** Herdr's default,
+measured by splitting with no ratio and exporting the tab straight back. The config's
+promise that an absent ratio is not overridden therefore still holds in effect.
+
+### `focus: false` is a real request, not a dead default
 
 The layout opens on the agent for a plainer reason than the parameter: the agent
-starts in the pane the workspace already arrived on, and nothing moves the cursor
-off it.
+starts in the first pane of the first tab, and nothing moves the cursor off it.
 
-`focus: false` is passed anyway, so **do not strip it as a dead default**. An
-accidental `true`, or a later Herdr that changes the default, would land the user
-in the last pane created rather than the one holding their agent.
+**Do not strip `focus: false` as a redundant default.** Measured on 0.9.0: a tab
+added with `focus: true` really does move the user to it, and `focus: false` really
+does leave them where they were. A multi-tab layout sending `true` would end with the
+user staring at whichever tab it happened to build last.
+
+A **replacement** inherits whatever the tab it replaced had, which is Herdr's choice
+rather than this plugin's. Replacing the focused tab leaves the replacement focused,
+because there is nothing else it could be. Replacing a tab that was **not** focused
+moves nothing — confirmed end to end against a live server, where a hand-made tab held
+the focus through a rebuild of two others.
 
 ## Labelling is opt-in
 

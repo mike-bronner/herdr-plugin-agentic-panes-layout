@@ -45,8 +45,15 @@ pub enum OnExisting {
 pub struct Outcome {
     pub notes: Vec<String>,
     pub built: Vec<String>,
+    /// Left alone by the tab-name guard on the event path.
     pub skipped: Vec<String>,
     pub rebuilt: Vec<String>,
+    /// Left alone because the confirmation was not affirmative.
+    ///
+    /// Separate from `skipped` because the two have nothing in common but the outcome.
+    /// Reporting a cancelled rebuild as "already there" would name the guard as the
+    /// reason and hide the user's own answer.
+    pub declined: Vec<String>,
 }
 
 pub struct Fatal(pub String);
@@ -58,19 +65,7 @@ impl Outcome {
             built: Vec::new(),
             skipped: Vec::new(),
             rebuilt: Vec::new(),
-        }
-    }
-}
-
-enum Root {
-    TookOver(String),
-    Created(String),
-}
-
-impl Root {
-    fn pane_id(&self) -> &str {
-        match self {
-            Root::TookOver(id) | Root::Created(id) => id,
+            declined: Vec::new(),
         }
     }
 }
@@ -91,52 +86,73 @@ pub fn apply(
     for (index, tab) in layout.tabs.iter().enumerate() {
         let already_there = existing.iter().any(|label| label == &tab.name);
 
-        let root = if already_there {
+        // WHICH TAB THIS ACTS ON. **Mike's decision, in his words: only destroy the tabs
+        // named in the layout.** Taken after being shown the consequence of a wider
+        // scope, which is that one keypress would destroy an unrelated tab.
+        //
+        // So a one-tab layout touches one tab, a three-tab layout replaces those three,
+        // and a tab the layout does not name survives either way. This is a chosen
+        // boundary rather than a conservative default somebody settled on, and
+        // `panes_of_another_tab_are_not_destroyed_by_a_rebuild` pins it.
+        let target_tab = if already_there {
             match on_existing {
                 OnExisting::Skip => {
                     outcome.skipped.push(tab.name.clone());
                     continue;
                 }
-                OnExisting::Rebuild => match clear_tab(client, target, tab, &mut outcome)? {
-                    Some(survivor) => {
+                OnExisting::Rebuild => match may_replace(client, target, tab, &mut outcome)? {
+                    Some(tab_id) => {
                         outcome.rebuilt.push(tab.name.clone());
-                        survivor
+                        api::LayoutTarget::ReplaceTab(tab_id)
                     }
                     None => {
-                        outcome.skipped.push(tab.name.clone());
+                        outcome.declined.push(tab.name.clone());
                         continue;
                     }
                 },
             }
+        } else if index == 0 && !active_taken && active_tab_is_free(target) {
+            // The first tab takes over the workspace's own tab, so a fresh worktree gets
+            // its layout where the user is already looking. Replacing it destroys the one
+            // bare pane that is there, which is why the tab has to be free to qualify.
+            active_taken = true;
+            outcome.built.push(tab.name.clone());
+            api::LayoutTarget::ReplaceTab(&target.active_tab_id)
         } else {
-            let opened = open_tab(client, target, tab, index == 0 && !active_taken, cwd)?;
-            if matches!(opened, Root::TookOver(_)) {
-                active_taken = true;
-            }
+            // A busy active tab is not wrecked, and every later tab is added beside the
+            // ones already there.
             existing.push(tab.name.clone());
             outcome.built.push(tab.name.clone());
-            Survivor {
-                pane_id: opened.pane_id().to_string(),
-                already_runs_an_agent: false,
-            }
+            api::LayoutTarget::AddToWorkspace(&target.workspace_id)
         };
 
-        let pane_ids = split_panes(client, target, tab, &root.pane_id, cwd)?;
-        run_commands(
-            client,
-            target,
-            tab,
-            &pane_ids,
-            root.already_runs_an_agent,
-            &mut outcome,
-        );
+        // ONE CALL builds the whole tab. It is atomic, so a rejected tree leaves nothing
+        // behind and there is no half-built tab to report or clean up.
+        let pane_ids = api::layout_apply(client, target_tab, &tab.name, tree_for(tab, cwd), false)
+            .map_err(|e| {
+                Fatal(format!(
+                    "{}: could not build tab \"{}\": {}",
+                    target.label, tab.name, e
+                ))
+            })?;
+
+        if pane_ids.len() != tab.panes.len() {
+            return Err(Fatal(format!(
+                "{}: tab \"{}\" wanted {} panes and Herdr made {}",
+                target.label,
+                tab.name,
+                tab.panes.len(),
+                pane_ids.len()
+            )));
+        }
+
+        run_commands(client, target, tab, &pane_ids, &mut outcome);
         write_labels(client, target, tab, &pane_ids, &mut outcome);
         start_agents(
             client,
             target,
             tab,
             &pane_ids,
-            root.already_runs_an_agent,
             &mut supplied_name,
             &mut outcome,
         )?;
@@ -145,109 +161,103 @@ pub fn apply(
     Ok(outcome)
 }
 
-/// The pane a rebuilt tab is rebuilt from.
-struct Survivor {
-    pane_id: String,
-    /// True when the survivor is a pane the user declined to close, so it is still
-    /// running its agent and must not be given another one or have a command typed
-    /// into it.
-    already_runs_an_agent: bool,
-}
-
-/// Empty an existing tab down to one pane, ready to be rebuilt from.
+/// Whether an existing tab may be replaced, and its id if so.
 ///
-/// Returns `None` when the rebuild must be abandoned, which happens only when the
-/// tab has no panes to work from at all.
+/// `layout.apply` with a `tab_id` destroys every pane in that tab, including one running
+/// an agent, and there is no way to carry a pane across: `pane_id` on a leaf is
+/// output-only. So a tab holding an agent is a question rather than a decision.
 ///
-/// A pane running an agent is never closed without an affirmative answer. On a
-/// refusal the agent's pane becomes the survivor: the tab is rebuilt around it and
-/// it keeps running, which is what "work around it" means. Every other pane of the
-/// tab is closed either way, because those hold no unrecoverable work.
-fn clear_tab(
+/// Returns `None` to mean leave this tab completely alone.
+fn may_replace<'a>(
     client: &Client,
-    target: &Target,
+    target: &'a Target,
     tab: &Tab,
     outcome: &mut Outcome,
-) -> Result<Option<Survivor>, Fatal> {
-    let tab_id = match target.tab_named(&tab.name) {
-        Some(info) => info.tab_id.clone(),
-        None => return Ok(None),
-    };
-    let panes = target.panes_of(&tab_id);
-    if panes.is_empty() {
-        outcome.notes.push(format!(
-            "tab \"{}\" reports no panes, so it was left alone",
-            tab.name
-        ));
+) -> Result<Option<&'a str>, Fatal> {
+    let Some(info) = target.tab_named(&tab.name) else {
         return Ok(None);
-    }
-
-    let with_agents: Vec<&LivePane> = panes
-        .iter()
-        .copied()
+    };
+    let with_agents: Vec<&LivePane> = target
+        .panes_of(&info.tab_id)
+        .into_iter()
         .filter(|p| p.agent.is_some())
         .collect();
 
-    // Nothing is at risk, so there is nothing to consent to. Asking here would stall
-    // the common case behind a popup for no reason.
-    let may_close_agents = if with_agents.is_empty() {
-        true
-    } else {
-        let (answer, note) = confirm::ask(client, &question(&tab.name, &with_agents));
-        if let Some(note) = note {
-            outcome
-                .notes
-                .push(format!("tab \"{}\": {}", tab.name, note));
-        }
-        match answer {
-            Answer::CloseIt => true,
-            Answer::KeepIt => false,
-            // The third choice, and every failure to ask or be answered. A misfire
-            // must cost nothing, so not one pane of this tab is touched.
-            Answer::DoNothing => return Ok(None),
-        }
-    };
-
-    let survivor = if may_close_agents {
-        panes[0]
-    } else {
-        with_agents[0]
-    };
-
-    for pane in &panes {
-        if pane.pane_id == survivor.pane_id {
-            continue;
-        }
-        if pane.agent.is_some() && !may_close_agents {
-            outcome.notes.push(format!(
-                "left pane {} running {} in tab \"{}\", unlabelled by the layout",
-                pane.pane_id,
-                pane.agent.as_deref().unwrap_or("an agent"),
-                tab.name
-            ));
-            continue;
-        }
-        if let Err(e) = confirm::close_pane(client, &pane.pane_id) {
-            outcome.notes.push(format!(
-                "could not close pane {} while rebuilding \"{}\": {}",
-                pane.pane_id, tab.name, e
-            ));
-        }
+    // Nothing is at risk, so there is nothing to consent to. Asking here would stall the
+    // common case behind a popup for no reason.
+    if with_agents.is_empty() {
+        return Ok(Some(&info.tab_id));
     }
 
-    if !may_close_agents {
-        outcome.notes.push(format!(
-            "kept {} running in {} and rebuilt tab \"{}\" around it",
-            survivor.agent.as_deref().unwrap_or("the agent"),
-            survivor.pane_id,
-            tab.name
-        ));
+    let (answer, note) = confirm::ask(client, &question(&tab.name, &with_agents));
+    if let Some(note) = note {
+        outcome
+            .notes
+            .push(format!("tab \"{}\": {}", tab.name, note));
     }
+    match answer {
+        Answer::CloseIt => Ok(Some(&info.tab_id)),
+        // Every other outcome, including a dismissal, a timeout, a popup that could not
+        // open and an answer that is none of the offered ones. A misfire must cost
+        // nothing, so not one pane of this tab is touched.
+        Answer::DoNothing => Ok(None),
+    }
+}
 
-    Ok(Some(Survivor {
-        pane_id: survivor.pane_id.clone(),
-        already_runs_an_agent: !may_close_agents,
-    }))
+/// A configured tab as the recursive tree `layout.apply` takes.
+///
+/// The config is a flat list where each pane after the first splits the one before it.
+/// That nests to the right: pane 1 against everything else, then pane 2 against
+/// everything after it, and so on. Reading it back out with `layout.export` on a tab the
+/// old sequential engine built returns exactly this shape, which is how the mapping was
+/// confirmed rather than assumed.
+///
+/// **A leaf carries `cwd` and nothing else**, and both omissions are deliberate.
+///
+/// `command` is left out because the field execs raw argv against the **server's** PATH.
+/// Under launchd that is `/usr/bin:/bin:/usr/sbin:/sbin`, so a bare `lazygit` would not
+/// resolve, and a whole command line in one element is looked up as a single executable
+/// name. A leaf with no command spawns the user's interactive login shell instead, which
+/// is what `pane.send_input` then types into, preserving their PATH, their rc and
+/// unquoted flags.
+///
+/// `label` is left out because an **empty** label on a leaf comes back as `null`,
+/// indistinguishable from an absent one. This plugin's whole labelling contract turns on
+/// telling those apart, so labels keep going through `pane.rename`.
+///
+/// `cwd` is set on **every** leaf rather than relying on inheritance: a leaf that omits
+/// it inherits its sibling's, not the workspace's.
+fn tree_for(tab: &Tab, cwd: &str) -> serde_json::Value {
+    fn node(panes: &[crate::config::Pane], cwd: &str) -> serde_json::Value {
+        let leaf = serde_json::json!({"type": "pane", "cwd": cwd});
+        match panes.split_first() {
+            None | Some((_, [])) => leaf,
+            Some((_, rest)) => {
+                // The split's direction and ratio belong to the pane being created, and
+                // the ratio is the share the pane being split keeps. That is what the
+                // config means and what the sequential engine did.
+                //
+                // **An absent ratio has to become a number here.** `pane.split` took a
+                // nullable ratio, so the old engine could leave it out and let Herdr
+                // choose; a split node cannot. Measured on 0.9.0: omitting it answers
+                // `missing field "ratio"` and `null` answers `expected f32`.
+                //
+                // 0.5 is not a guess at Herdr's default, it IS Herdr's default: a
+                // `pane.split` with no ratio exports back as `"ratio": 0.5`. So the
+                // config's promise that an absent ratio is not invented still holds in
+                // effect, even though the wire now carries a value.
+                let next = &rest[0];
+                serde_json::json!({
+                    "type": "split",
+                    "direction": next.split.map(|d| d.as_str()).unwrap_or("right"),
+                    "ratio": next.ratio.unwrap_or(0.5),
+                    "first": leaf,
+                    "second": node(rest, cwd),
+                })
+            }
+        }
+    }
+    node(&tab.panes, cwd)
 }
 
 fn question(tab_name: &str, with_agents: &[&LivePane]) -> String {
@@ -274,80 +284,9 @@ fn question(tab_name: &str, with_agents: &[&LivePane]) -> String {
     }
 }
 
-fn open_tab(
-    client: &Client,
-    target: &Target,
-    tab: &Tab,
-    may_take_over: bool,
-    cwd: &str,
-) -> Result<Root, Fatal> {
-    if may_take_over && active_tab_is_free(target) {
-        let pane_id = target.active_panes()[0].pane_id.clone();
-        api::tab_rename(client, &target.active_tab_id, &tab.name).map_err(|e| {
-            Fatal(format!(
-                "{}: could not rename the tab to \"{}\": {}",
-                target.label, tab.name, e
-            ))
-        })?;
-        return Ok(Root::TookOver(pane_id));
-    }
-
-    api::tab_create(client, &target.workspace_id, cwd, &tab.name)
-        .map(Root::Created)
-        .map_err(|e| {
-            Fatal(format!(
-                "{}: could not create the tab \"{}\": {}",
-                target.label, tab.name, e
-            ))
-        })
-}
-
 fn active_tab_is_free(target: &Target) -> bool {
     let active = target.active_panes();
     active.len() == 1 && active[0].agent.is_none()
-}
-
-fn split_panes(
-    client: &Client,
-    target: &Target,
-    tab: &Tab,
-    root_pane_id: &str,
-    cwd: &str,
-) -> Result<Vec<String>, Fatal> {
-    let mut pane_ids = vec![root_pane_id.to_string()];
-    for pane in tab.panes.iter().skip(1) {
-        let direction = pane.split.ok_or_else(|| {
-            Fatal(format!(
-                "{}: tab \"{}\" carries a pane with no split direction",
-                target.label, tab.name
-            ))
-        })?;
-        let previous = pane_ids
-            .last()
-            .expect("the root pane is always present")
-            .clone();
-        let made = api::pane_split(client, &previous, direction.as_str(), pane.ratio, cwd)
-            .map_err(|e| {
-                Fatal(format!(
-                    "{}: could not split {} in tab \"{}\" ({}, ratio {}): {}",
-                    target.label,
-                    previous,
-                    tab.name,
-                    direction.as_str(),
-                    describe_ratio(pane.ratio),
-                    e
-                ))
-            })?;
-        pane_ids.push(made);
-    }
-    Ok(pane_ids)
-}
-
-fn describe_ratio(ratio: Option<f64>) -> String {
-    match ratio {
-        Some(r) => r.to_string(),
-        None => "unset".to_string(),
-    }
 }
 
 fn run_commands(
@@ -355,21 +294,9 @@ fn run_commands(
     target: &Target,
     tab: &Tab,
     pane_ids: &[String],
-    first_pane_is_busy: bool,
     outcome: &mut Outcome,
 ) {
-    for (index, (pane, pane_id)) in tab.panes.iter().zip(pane_ids).enumerate() {
-        // Typing a command into a pane whose agent the user just asked to keep
-        // would send the text to the agent as a prompt.
-        if index == 0 && first_pane_is_busy {
-            if pane.command.is_some() {
-                outcome.notes.push(format!(
-                    "did not run the command in {}, which is still running an agent",
-                    pane_id
-                ));
-            }
-            continue;
-        }
+    for (pane, pane_id) in tab.panes.iter().zip(pane_ids) {
         if let Some(command) = pane.command.as_deref() {
             if let Err(e) = api::pane_run(client, pane_id, command) {
                 outcome.notes.push(format!(
@@ -405,24 +332,14 @@ fn start_agents(
     target: &Target,
     tab: &Tab,
     pane_ids: &[String],
-    first_pane_is_busy: bool,
     supplied_name: &mut Option<&str>,
     outcome: &mut Outcome,
 ) -> Result<(), Fatal> {
-    for (index, (pane, pane_id)) in tab.panes.iter().zip(pane_ids).enumerate() {
+    for (pane, pane_id) in tab.panes.iter().zip(pane_ids) {
         let kind = match pane.agent.as_deref() {
             Some(kind) => kind,
             None => continue,
         };
-        // The user declined to close this pane, so its agent stays. Starting a
-        // second one in it would be the very thing they refused.
-        if index == 0 && first_pane_is_busy {
-            outcome.notes.push(format!(
-                "{} already runs an agent, so no {} was started in it",
-                pane_id, kind
-            ));
-            continue;
-        }
         match supplied_name.take() {
             Some(exact) => start_exact(client, target, kind, pane_id, exact, outcome)?,
             None => start_derived(client, target, kind, pane_id, outcome)?,

@@ -37,8 +37,10 @@ fn a_syntax_error_falls_back_to_the_built_in_layout_and_reports_it() {
     assert_eq!(run.status, 0, "{}", run.stderr);
     assert!(run.says("is not usable"), "{}", run.stderr);
     assert!(run.says("the built-in layout applies"), "{}", run.stderr);
-    // And the layout still happened.
-    assert_eq!(stub.params_for("pane.split").len(), 2);
+    // And the layout still happened: the built-in one is three panes, so its tree is
+    // two nested splits.
+    assert_eq!(stub.applies().len(), 1);
+    assert_eq!(leaves(&stub.params_for("layout.apply")[0]["root"]), 3);
 }
 
 #[test]
@@ -65,8 +67,8 @@ nonsense = 1
     assert!(run.says("unknown key \"colour\""), "{}", run.stderr);
     assert!(run.says("nonsense"), "{}", run.stderr);
     assert_eq!(
-        stub.params_for("tab.rename"),
-        vec![json!({"tab_id": "t1", "label": "work"})]
+        stub.applies(),
+        vec![(Applied::Replace("t1".into()), "work".to_string())]
     );
     assert_eq!(
         stub.params_for("pane.send_input")[0]["text"],
@@ -87,8 +89,8 @@ fn a_layout_name_nothing_defines_falls_back_and_reports_it() {
     assert_eq!(run.status, 0, "{}", run.stderr);
     assert!(run.says("no layout named \"absent\""), "{}", run.stderr);
     assert_eq!(
-        stub.params_for("tab.rename"),
-        vec![json!({"tab_id": "t1", "label": "agent"})]
+        stub.applies(),
+        vec![(Applied::Replace("t1".into()), "agent".to_string())]
     );
 }
 
@@ -123,7 +125,7 @@ fn an_invalid_split_direction_is_refused_at_parse_time() {
     assert_eq!(run.status, 0, "{}", run.stderr);
     assert!(run.says("is not usable"), "{}", run.stderr);
     // The built-in layout applied instead, so the workspace is not half-built.
-    assert_eq!(stub.params_for("pane.split").len(), 2);
+    assert_eq!(leaves(&stub.params_for("layout.apply")[0]["root"]), 3);
 }
 
 #[test]
@@ -176,9 +178,14 @@ fn a_first_pane_carrying_a_split_is_refused() {
 }
 
 #[test]
-fn a_split_with_no_ratio_omits_the_ratio_rather_than_inventing_one() {
-    // Herdr's ratio param is nullable, so leaving it out lets Herdr pick its own
-    // default. Substituting 0.5 here would silently override that choice.
+fn a_split_with_no_ratio_sends_the_ratio_herdr_would_have_picked() {
+    // `pane.split` took a nullable ratio and the old engine left it out. A split node
+    // cannot: measured on 0.9.0, omitting `ratio` answers `missing field "ratio"` and
+    // `null` answers `expected f32`. So a number has to go on the wire.
+    //
+    // 0.5 is the number Herdr itself picks, measured by splitting with no ratio and
+    // exporting the tab straight back. Sending it therefore keeps the config's promise
+    // that an absent ratio is not overridden with somebody's invention.
     let dir = TempDir::new();
     let root = config_root_with(
         &dir,
@@ -188,9 +195,9 @@ fn a_split_with_no_ratio_omits_the_ratio_rather_than_inventing_one() {
     );
     let stub = Stub::start(Script::default());
     run(&stub, &[], Some(root.as_path()));
-    let split = &stub.params_for("pane.split")[0];
-    assert_eq!(split["direction"], json!("down"));
-    assert!(split.get("ratio").is_none(), "{:?}", split);
+    let root = &stub.params_for("layout.apply")[0]["root"];
+    assert_eq!(root["direction"], json!("down"));
+    assert_eq!(root["ratio"], json!(0.5));
 }
 
 #[test]
@@ -223,8 +230,8 @@ fn the_config_root_is_derived_from_the_plugin_config_dir() {
     );
     assert_eq!(run.status, 0, "{}", run.stderr);
     assert_eq!(
-        stub.params_for("tab.rename"),
-        vec![json!({"tab_id": "t1", "label": "derived"})]
+        stub.applies(),
+        vec![(Applied::Replace("t1".into()), "derived".to_string())]
     );
 }
 

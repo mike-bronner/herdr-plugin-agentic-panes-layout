@@ -30,25 +30,28 @@
 //! answered because nothing is displaying it. That case runs out the full timeout and
 //! then changes nothing, which is slow but safe.
 //!
-//! **There are three answers, not two, and every failure is the third.**
+//! **Two answers, and every failure is the second.**
 //!
 //! - `y` closes the pane running the agent and rebuilds the tab clean.
-//! - `n` keeps the agent and rebuilds the rest of the layout around it.
 //! - `esc` changes nothing at all.
 //!
-//! A dismissed popup, a popup that could not be opened, a question that timed out,
-//! and an answer nobody recognises all mean **the third one**. The reason `esc`
-//! exists is that without it the cheapest available answer still rearranges every
-//! other pane in the tab, so a misfire costs a rearranged workspace. A popup the
-//! user closed or ignored is the same class of event as a misfire, so it must be
-//! just as free. Acting on silence is the thing being prevented.
+//! There was a third, `n`, which kept the agent and built the layout around it. It is
+//! gone because the engine cannot express it: `layout.apply` replaces a tab wholesale
+//! and `pane_id` on a leaf is output-only, so a running agent cannot be carried into a
+//! new tree. Mike dropped the requirement rather than the rewrite, on the grounds that
+//! new panes are being made anyway.
+//!
+//! A dismissed popup, a popup that could not be opened, a question that timed out, and
+//! an answer nobody recognises all mean **`esc`**. That reasoning is unchanged by losing
+//! `n`: a popup the user closed or ignored is the same class of event as a misfire, and
+//! acting on silence is the thing being prevented.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-use crate::api::{self, Client};
+use crate::api::Client;
 
 pub const PLUGIN_ID: &str = "mikebronner.agentic-panes-layout";
 pub const PANE_ENTRYPOINT: &str = "confirm";
@@ -56,10 +59,9 @@ pub const QUESTION_VAR: &str = "AGENT_LAYOUT_QUESTION";
 pub const ANSWER_VAR: &str = "AGENT_LAYOUT_ANSWER_FILE";
 pub const STARTED_VAR: &str = "AGENT_LAYOUT_STARTED_FILE";
 
-/// The three words the popup and the waiting side exchange. One definition, so the
-/// two halves cannot drift into always disagreeing.
+/// The words the popup and the waiting side exchange. One definition, so the two halves
+/// cannot drift into always disagreeing.
 pub const CLOSE_IT: &str = "close";
-pub const KEEP_IT: &str = "keep";
 pub const DO_NOTHING: &str = "nothing";
 
 /// How long to wait for an answer before giving up and answering No. Generous,
@@ -77,13 +79,11 @@ const STARTUP: Duration = Duration::from_secs(3);
 /// each check spawns a process.
 const LIVENESS: Duration = Duration::from_millis(500);
 
-/// The three things the user can mean.
+/// The two things the user can mean.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Answer {
     /// `y`: close the pane running the agent and rebuild the tab clean.
     CloseIt,
-    /// `n`: keep the agent running and rebuild the rest of the layout around it.
-    KeepIt,
     /// `esc`, or any failure to ask or be answered: change nothing at all.
     DoNothing,
 }
@@ -273,7 +273,6 @@ pub fn decide(ended: Ended) -> (Answer, Option<String>) {
     match ended {
         Ended::Answered(text) => match text.as_str() {
             CLOSE_IT => (Answer::CloseIt, None),
-            KEEP_IT => (Answer::KeepIt, None),
             DO_NOTHING => (
                 Answer::DoNothing,
                 Some("the confirmation was cancelled, so the tab was left alone".to_string()),
@@ -281,8 +280,8 @@ pub fn decide(ended: Ended) -> (Answer, Option<String>) {
             other => (
                 Answer::DoNothing,
                 Some(format!(
-                    "the confirmation answered \"{}\", which is none of the three choices, \
-                     so the tab was left alone",
+                    "the confirmation answered \"{}\", which is neither choice, so the \
+                     tab was left alone",
                     other
                 )),
             ),
@@ -330,7 +329,6 @@ pub fn run_popup() -> Result<(), String> {
     println!("{}", question);
     println!();
     println!("  y    close it and rebuild the tab");
-    println!("  n    keep it running and build the rest around it");
     println!("  esc  change nothing");
     println!();
     use std::io::Write;
@@ -346,7 +344,6 @@ pub fn run_popup() -> Result<(), String> {
         "{}",
         match answer {
             CLOSE_IT => "Closing it and rebuilding.",
-            KEEP_IT => "Leaving it running and building around it.",
             _ => "Changing nothing.",
         }
     );
@@ -387,8 +384,14 @@ fn read_key() -> Option<&'static str> {
                 }
                 match code {
                     KeyCode::Char('y') | KeyCode::Char('Y') => break CLOSE_IT,
-                    KeyCode::Char('n') | KeyCode::Char('N') => break KEEP_IT,
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => break DO_NOTHING,
+                    // `n` is deliberately NOT an acting key. It used to keep the agent
+                    // and build around it, and somebody with that habit pressing it now
+                    // must change nothing rather than destroy the pane.
+                    KeyCode::Esc
+                    | KeyCode::Char('n')
+                    | KeyCode::Char('N')
+                    | KeyCode::Char('q')
+                    | KeyCode::Char('Q') => break DO_NOTHING,
                     // Ctrl-C in raw mode is a key event, not a signal, and it means
                     // the same as Esc.
                     KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
@@ -416,17 +419,9 @@ fn read_line() -> &'static str {
         Ok(0) | Err(_) => DO_NOTHING,
         Ok(_) => match typed.trim().to_ascii_lowercase().as_str() {
             "y" | "yes" => CLOSE_IT,
-            "n" | "no" => KEEP_IT,
             _ => DO_NOTHING,
         },
     }
-}
-
-/// Close a pane, for the panes a rebuild replaces.
-pub fn close_pane(client: &Client, pane_id: &str) -> Result<(), api::CallError> {
-    client
-        .call("pane.close", json!({"pane_id": pane_id}))
-        .map(|_| ())
 }
 
 #[cfg(test)]
@@ -434,9 +429,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_three_words_map_to_the_three_answers() {
+    fn the_two_words_map_to_the_two_answers() {
         assert_eq!(decide(Ended::Answered(CLOSE_IT.into())).0, Answer::CloseIt);
-        assert_eq!(decide(Ended::Answered(KEEP_IT.into())).0, Answer::KeepIt);
         assert_eq!(
             decide(Ended::Answered(DO_NOTHING.into())).0,
             Answer::DoNothing
@@ -444,12 +438,20 @@ mod tests {
     }
 
     #[test]
+    fn the_word_the_third_answer_used_is_no_longer_acted_on() {
+        // `keep` used to mean "keep the agent and build around it". A popup left over
+        // from an older build, or anything else still sending it, must change nothing
+        // rather than fall through to destroying the pane.
+        assert_eq!(decide(Ended::Answered("keep".into())).0, Answer::DoNothing);
+    }
+
+    #[test]
     fn only_the_exact_word_closes_a_pane() {
         // The safety property in one place. Every one of these would otherwise be
         // able to close a pane running an agent, whose work cannot be recovered.
         for ended in [
-            Ended::Answered(KEEP_IT.into()),
             Ended::Answered(DO_NOTHING.into()),
+            Ended::Answered("keep".into()),
             Ended::Answered("".into()),
             Ended::Answered("maybe".into()),
             Ended::Answered("CLOSE".into()),
@@ -466,8 +468,8 @@ mod tests {
 
     #[test]
     fn every_failure_to_be_answered_changes_nothing() {
-        // Not KeepIt. A dismissed or unanswered popup is the same class of event as a
-        // misfire, and KeepIt would still rearrange every other pane in the tab.
+        // A dismissed or unanswered popup is the same class of event as a misfire, and
+        // the only other answer destroys a pane running an agent.
         for ended in [
             Ended::Dismissed,
             Ended::NeverShown,
@@ -483,7 +485,6 @@ mod tests {
     fn an_acted_on_answer_is_silent_and_every_other_ending_explains_itself() {
         // A silent no-op after a keypress reads as a broken keybinding.
         assert_eq!(decide(Ended::Answered(CLOSE_IT.into())).1, None);
-        assert_eq!(decide(Ended::Answered(KEEP_IT.into())).1, None);
         assert!(decide(Ended::Answered(DO_NOTHING.into()))
             .1
             .unwrap()
@@ -491,7 +492,7 @@ mod tests {
         assert!(decide(Ended::Answered("maybe".into()))
             .1
             .unwrap()
-            .contains("none of the three choices"));
+            .contains("neither choice"));
         assert!(decide(Ended::Dismissed).1.unwrap().contains("dismissed"));
         assert!(decide(Ended::NeverShown)
             .1
@@ -501,11 +502,9 @@ mod tests {
     }
 
     #[test]
-    fn the_three_words_are_distinct() {
+    fn the_two_words_are_distinct() {
         // They travel through a file between two processes, so a collision would make
         // one choice unreachable.
-        assert_ne!(CLOSE_IT, KEEP_IT);
-        assert_ne!(KEEP_IT, DO_NOTHING);
         assert_ne!(CLOSE_IT, DO_NOTHING);
     }
 }

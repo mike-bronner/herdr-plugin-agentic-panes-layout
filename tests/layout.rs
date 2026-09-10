@@ -2,7 +2,7 @@
 
 mod support;
 
-use serde_json::json;
+use serde_json::{json, Value};
 use support::*;
 
 #[test]
@@ -16,27 +16,111 @@ fn the_built_in_default_reproduces_the_v0_2_0_arrangement() {
     let run = run(&stub, &[], None);
     assert_eq!(run.status, 0, "{}", run.stderr);
 
+    // ONE call builds the tab, and the tree carries the same geometry the sequential
+    // engine produced: split right at 0.5, then the remainder split down at 0.6.
+    let applied = stub.params_for("layout.apply");
+    assert_eq!(applied.len(), 1, "one call per tab: {:?}", stub.methods());
+    assert_eq!(applied[0]["tab_label"], json!("agent"));
     assert_eq!(
-        stub.params_for("tab.rename"),
-        vec![json!({"tab_id": "t1", "label": "agent"})]
+        applied[0]["root"],
+        json!({
+            "type": "split", "direction": "right", "ratio": 0.5,
+            "first": {"type": "pane", "cwd": "/tmp/proj"},
+            "second": {
+                "type": "split", "direction": "down", "ratio": 0.6,
+                "first": {"type": "pane", "cwd": "/tmp/proj"},
+                "second": {"type": "pane", "cwd": "/tmp/proj"}
+            }
+        })
     );
-    assert_eq!(
-        stub.params_for("pane.split"),
-        vec![
-            json!({"target_pane_id": "p1", "direction": "right", "ratio": 0.5,
-                   "cwd": "/tmp/proj", "focus": false}),
-            json!({"target_pane_id": "p2", "direction": "down", "ratio": 0.6,
-                   "cwd": "/tmp/proj", "focus": false}),
-        ]
-    );
+    // Commands and agents still go through their own calls, on ids from the response.
     assert_eq!(
         stub.params_for("pane.send_input"),
-        vec![json!({"pane_id": "p2", "text": "lazygit", "keys": ["enter"]})]
+        vec![json!({"pane_id": "t2p2", "text": "lazygit", "keys": ["enter"]})]
     );
     assert_eq!(
         stub.params_for("agent.start"),
-        vec![json!({"name": "proj-one", "kind": "claude", "pane_id": "p1"})]
+        vec![json!({"name": "proj-one", "kind": "claude", "pane_id": "t2p1"})]
     );
+}
+
+#[test]
+fn no_leaf_carries_a_command_or_a_label() {
+    // Both are deliberate and both were measured. The leaf's `command` execs raw argv
+    // against the SERVER's PATH, which under launchd would not resolve a bare `lazygit`,
+    // and a whole command line in one element is looked up as one executable name. The
+    // leaf's `label` cannot express an empty string: it comes back as null, which is what
+    // an absent label also looks like, and this plugin's contract turns on telling those
+    // apart.
+    let dir = TempDir::new();
+    let root = config_root_with(
+        &dir,
+        "default = \"one\"\n[[layouts.one.tabs]]\nname = \"agent\"\n\
+         [[layouts.one.tabs.panes]]\ncommand = \"lazygit\"\nlabel = \"git\"\n",
+    );
+    let stub = Stub::start(Script::default());
+    run(&stub, &[], Some(root.as_path()));
+    let tree = stub.params_for("layout.apply")[0]["root"].clone();
+    assert!(tree.get("command").is_none(), "{:?}", tree);
+    assert!(tree.get("label").is_none(), "{:?}", tree);
+    assert_eq!(
+        tree["cwd"],
+        json!("/tmp/proj"),
+        "every leaf sets its own cwd"
+    );
+}
+
+#[test]
+fn every_leaf_sets_its_own_cwd_rather_than_inheriting() {
+    // Measured on 0.9.0: a leaf omitting cwd inherits its SIBLING's, not the workspace's.
+    // Setting it everywhere removes that surprise.
+    let stub = Stub::start(Script::default());
+    run(&stub, &[], None);
+    fn every_leaf(node: &Value, seen: &mut usize) {
+        match node["type"].as_str() {
+            Some("pane") => {
+                assert_eq!(node["cwd"], json!("/tmp/proj"), "{:?}", node);
+                *seen += 1;
+            }
+            Some("split") => {
+                every_leaf(&node["first"], seen);
+                every_leaf(&node["second"], seen);
+            }
+            _ => panic!("unexpected node {:?}", node),
+        }
+    }
+    let mut seen = 0;
+    every_leaf(&stub.params_for("layout.apply")[0]["root"], &mut seen);
+    assert_eq!(seen, 3);
+}
+
+#[test]
+fn no_tab_the_layout_builds_takes_the_focus() {
+    // Measured on 0.9.0: `focus: true` on an added tab really does move the user to it,
+    // and `focus: false` really does leave them where they were. So a multi-tab layout
+    // sending true would end with the user staring at the last tab it happened to
+    // build, which is not the one they were working in.
+    //
+    // Replacing a workspace's only tab is the exception the measurement also settled:
+    // the replacement comes back focused whatever is sent, because nothing else is left
+    // to focus. That is Herdr's choice, not this plugin asking for it.
+    let dir = TempDir::new();
+    let root = config_root_with(
+        &dir,
+        "default = \"pair\"\n\
+         [[layouts.pair.tabs]]\nname = \"agent\"\n\
+         [[layouts.pair.tabs.panes]]\nagent = \"claude\"\n\
+         [[layouts.pair.tabs]]\nname = \"notes\"\n\
+         [[layouts.pair.tabs.panes]]\ncommand = \"true\"\n",
+    );
+    let stub = Stub::start(Script::default());
+    let run = run(&stub, &[], Some(root.as_path()));
+    assert_eq!(run.status, 0, "{}", run.stderr);
+    let applied = stub.params_for("layout.apply");
+    assert_eq!(applied.len(), 2);
+    for call in applied {
+        assert_eq!(call["focus"], json!(false), "{:?}", call);
+    }
 }
 
 #[test]
@@ -53,28 +137,43 @@ fn the_built_in_default_labels_nothing() {
 }
 
 #[test]
-fn the_second_split_targets_the_pane_the_first_one_made() {
-    // The crux of the two-split layout. The middle pane's id is not knowable in
-    // advance: it exists only in pane.split's answer. Splitting p1 twice would
-    // stack three panes down the agent's side instead of dividing the column
-    // beside it, and every ratio would then apply to the wrong pane.
-    let stub = Stub::start(Script::default());
-    run(&stub, &[], None);
-    let splits = stub.params_for("pane.split");
-    assert_eq!(splits.len(), 2);
-    assert_eq!(splits[0]["target_pane_id"], json!("p1"));
-    assert_eq!(splits[1]["target_pane_id"], json!("p2"));
-}
-
-#[test]
 fn the_command_runs_in_its_own_pane_and_no_other() {
-    // p2 is the pane the first split made. Running lazygit in p1 would replace
-    // the agent, and in p3 would fill the bare shell.
+    // The second leaf's pane, taken from the apply response. Running lazygit in the first
+    // would replace the agent, and in the third would fill the bare shell.
     let stub = Stub::start(Script::default());
     run(&stub, &[], None);
     let runs = stub.params_for("pane.send_input");
     assert_eq!(runs.len(), 1);
-    assert_eq!(runs[0]["pane_id"], json!("p2"));
+    assert_eq!(runs[0]["pane_id"], json!("t2p2"));
+}
+
+#[test]
+fn a_failed_apply_is_fatal_and_names_the_tab() {
+    // The call is atomic, so a rejected tree leaves no tab behind. There is nothing
+    // half-built to report and nothing to clean up.
+    let stub = Stub::start(Script::default().failing("layout.apply", "layout_apply_failed"));
+    let run = run(&stub, &[], None);
+    assert_eq!(run.status, 1);
+    assert!(run.says("could not build tab \"agent\""), "{}", run.stderr);
+    assert!(stub.params_for("pane.send_input").is_empty());
+    assert!(stub.params_for("agent.start").is_empty());
+    assert!(stub.params_for("pane.rename").is_empty());
+}
+
+#[test]
+fn a_response_with_the_wrong_pane_count_is_fatal_rather_than_misapplied() {
+    // Commands, labels and agents are matched to panes by position in the tree. A
+    // response carrying a different number of panes would silently put them in the wrong
+    // places, which is worse than stopping.
+    let stub = Stub::start(Script::default().apply_returns_panes(2));
+    let run = run(&stub, &[], None);
+    assert_eq!(run.status, 1);
+    assert!(
+        run.says("wanted 3 panes and Herdr made 2"),
+        "{}",
+        run.stderr
+    );
+    assert!(stub.params_for("agent.start").is_empty());
 }
 
 #[test]
@@ -104,56 +203,6 @@ fn the_agent_name_is_derived_from_the_workspace_label() {
         stub.params_for("agent.start")[0]["name"],
         json!("a9-bible-models")
     );
-}
-
-#[test]
-fn a_failed_tab_rename_is_fatal_and_stops_before_any_split() {
-    // The tab rename happens before any pane of ours exists, so dying leaves a
-    // clean single pane the next run can lay out.
-    let stub = Stub::start(Script::default().failing("tab.rename", "tab_not_found"));
-    let run = run(&stub, &[], None);
-    assert_eq!(run.status, 1);
-    assert!(run.says("could not rename the tab"), "{}", run.stderr);
-    assert!(stub.params_for("pane.split").is_empty());
-}
-
-#[test]
-fn a_failed_split_is_fatal_and_names_the_direction_and_ratio_it_used() {
-    let stub = Stub::start(Script::default().fail_split(1));
-    let run = run(&stub, &[], None);
-    assert_eq!(run.status, 1);
-    assert!(run.says("(right, ratio 0.5)"), "{}", run.stderr);
-}
-
-#[test]
-fn a_failed_first_split_never_reaches_the_second() {
-    // The second split needs the first one's answer. Carrying on with an empty
-    // pane id would aim pane.split and pane.send_input at nothing.
-    let stub = Stub::start(Script::default().fail_split(1));
-    let run = run(&stub, &[], None);
-    assert_eq!(run.status, 1);
-    assert_eq!(stub.params_for("pane.split").len(), 1);
-    assert!(stub.params_for("pane.send_input").is_empty());
-}
-
-#[test]
-fn a_failed_second_split_names_its_own_direction_and_ratio() {
-    // Distinct from the first split's message, which names the other pair.
-    // Reporting the wrong ratio sends the reader to the wrong line of their file.
-    let stub = Stub::start(Script::default().fail_split(2));
-    let run = run(&stub, &[], None);
-    assert_eq!(run.status, 1);
-    assert!(run.says("(down, ratio 0.6)"), "{}", run.stderr);
-    assert!(!run.says("(right, ratio 0.5)"), "{}", run.stderr);
-}
-
-#[test]
-fn a_failed_second_split_stops_before_running_the_command_or_the_agent() {
-    let stub = Stub::start(Script::default().fail_split(2));
-    run(&stub, &[], None);
-    assert!(stub.params_for("pane.send_input").is_empty());
-    assert!(stub.params_for("pane.rename").is_empty());
-    assert!(stub.params_for("agent.start").is_empty());
 }
 
 #[test]
@@ -304,9 +353,9 @@ fn labels_are_written_when_the_config_asks_for_them() {
     assert_eq!(
         stub.params_for("pane.rename"),
         vec![
-            json!({"pane_id": "p1", "label": "agent"}),
-            json!({"pane_id": "p2", "label": "lazygit"}),
-            json!({"pane_id": "p3", "label": "shell"}),
+            json!({"pane_id": "t2p1", "label": "agent"}),
+            json!({"pane_id": "t2p2", "label": "lazygit"}),
+            json!({"pane_id": "t2p3", "label": "shell"}),
         ]
     );
 }
@@ -331,7 +380,7 @@ label = "my tool pane"
     run(&stub, &[], Some(root.as_path()));
     assert_eq!(
         stub.params_for("pane.rename"),
-        vec![json!({"pane_id": "p1", "label": "my tool pane"})]
+        vec![json!({"pane_id": "t2p1", "label": "my tool pane"})]
     );
 }
 
@@ -351,7 +400,7 @@ fn an_empty_label_renames_and_an_absent_label_does_not() {
     run(&stub, &[], Some(empty.as_path()));
     assert_eq!(
         stub.params_for("pane.rename"),
-        vec![json!({"pane_id": "p1", "label": ""})]
+        vec![json!({"pane_id": "t2p1", "label": ""})]
     );
 
     let other = TempDir::new();

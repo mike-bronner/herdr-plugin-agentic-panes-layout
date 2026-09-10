@@ -146,7 +146,11 @@ fn describe_pane(index: usize, pane: &config::Pane) -> String {
             index,
             match pane.ratio {
                 Some(r) => format!(", pane {} keeps {}", index, r),
-                None => ", ratio unset so Herdr chooses".to_string(),
+                // The number is shown rather than "Herdr chooses", because the layout
+                // call requires one and this is the one it gets — measurably Herdr's own
+                // default. A reader checking their config wants the value that will be
+                // applied, not a promise that somebody else will decide.
+                None => format!(", ratio unset so pane {} keeps 0.5, Herdr's default", index),
             }
         ),
         (_, None) => "no split, which is an error".to_string(),
@@ -383,13 +387,21 @@ label = "shell"
     }
 
     #[test]
-    fn an_unset_ratio_is_named_rather_than_shown_as_a_number() {
+    fn an_unset_ratio_shows_the_number_that_will_actually_be_applied() {
+        // It used to say "Herdr chooses", which was true when the ratio could be left
+        // off the wire. A split node requires one, so 0.5 goes out — Herdr's own default,
+        // measured. Someone checking a config wants the value, and being told a choice is
+        // pending would send them looking for a setting that does not exist.
         let (out, _) = rendered(
             "default = \"one\"\n[[layouts.one.tabs]]\nname = \"t\"\n\
              [[layouts.one.tabs.panes]]\nagent = \"claude\"\n\
              [[layouts.one.tabs.panes]]\nsplit = \"down\"\n",
         );
-        assert!(out.contains("ratio unset so Herdr chooses"), "{}", out);
+        assert!(
+            out.contains("ratio unset so pane 1 keeps 0.5, Herdr's default"),
+            "{}",
+            out
+        );
     }
 
     #[test]

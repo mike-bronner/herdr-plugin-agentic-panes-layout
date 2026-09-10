@@ -135,11 +135,15 @@ pane that made at 0.6 downward. That is exactly what v0.2.0 did with its
 the same "share kept by the pane being split" meaning.
 
 Splits target the previous pane and nothing else. There is no way to name an
-arbitrary pane to split from, because nothing has asked for one.
+arbitrary pane to split from, because nothing has asked for one. That is a limit of
+this file format rather than of Herdr: the engine sends a tree that could nest any
+way at all.
 
-**`ratio` is optional and is not invented when absent.** Herdr's `ratio`
-parameter is nullable, so leaving it out lets Herdr choose. Substituting `0.5`
-here would silently override that choice.
+**`ratio` is optional, and an absent one is not overridden with somebody's
+invention.** It reaches Herdr as `0.5`, which is measurably the number Herdr picks for
+itself: a split made with no ratio at all, read straight back, comes back `0.5`. The
+value has to be on the wire because a split in Herdr's layout tree requires one, so
+"let Herdr choose" is expressed by choosing what Herdr would have.
 
 **Both ratios name the share kept by the pane being split**, so a bigger number
 always means a bigger original pane. Herdr does not document this and a 0.5
