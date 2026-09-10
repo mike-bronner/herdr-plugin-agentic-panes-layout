@@ -219,12 +219,27 @@ missing when git does.
 When the two disagree the output says `STALE` and names the fix. Printing two numbers and
 leaving the reader to compare them invites a bug report rather than a diagnosis.
 
-### Nothing in it can fail
+### Nothing in it can fail, and each failure names itself
 
-Every lookup degrades to a word: `unknown` for the commit, `manifest unknown` when the
-file is missing or unparseable. This is the command reached for when everything else is
-broken, so one that errored because it could not find its own manifest would be worse
-than one that says less.
+Every lookup degrades to a sentence rather than an error. This is the command reached for
+when everything else is broken, so one that errored because it could not find its own
+manifest would be worse than one that says less.
+
+The manifest paths were once a single `Option`, so four different situations printed one
+message: "manifest unknown". That tells a troubleshooter nothing about which they are in,
+and troubleshooting is the use this line was endorsed for. They are distinguished now:
+
+| Situation | What it prints |
+| --- | --- |
+| The plugin root cannot be resolved | `manifest not found: set HERDR_PLUGIN_ROOT to the plugin checkout to read it` |
+| The file cannot be read | `manifest unreadable at <path>` |
+| The file is not TOML | `manifest unparsed at <path>` |
+| The file has no `version` key | `manifest has no version key at <path>` |
+
+The first names its own fix, which is the property that makes the `STALE` line worth
+having. The first three match `mikebronner.recent-spaces`, which was asked for the same
+format; the fourth is ours, because that plugin's three do not cover a manifest that
+reads perfectly and simply has no version in it.
 
 The build script holds the same rule. Git may be absent, and the plugin root may not be a
 repository at all: `herdr plugin install` clones, but a source tarball would not. Herdr
@@ -240,12 +255,34 @@ whose source is not what was compiled. That is the same class of failure as the 
 binary this exists to catch, so hiding it would undercut the point. A `status` that
 itself fails reads `-unverified` rather than being claimed as clean.
 
-**Both the sources and the git head are watched for rebuilds.** Neither cargo default is
-right. With no `cargo:rerun-if-changed` at all, the script reruns on a package change and
-would miss a commit made with no file edits, embedding a stale commit — a poor joke given
-what this is for. With only the git paths, a source edit would not rerun it and the build
-time would predate the binary beside it. Watching `src` and `.git/HEAD` plus the ref it
-points at costs two short commands per rebuild and leaves neither field able to go stale.
+**The watch list and the dirty pathspec are one list.** `BUILD_INPUTS` holds `src`,
+`build.rs`, `Cargo.toml` and `Cargo.lock`, and both halves read it: the paths cargo
+watches for a rebuild, and the pathspec `git status` is asked about.
+
+They used to differ, watching `src` while asking about the whole tree, which matched
+neither meaning: a modified README could mark the binary dirty with nothing rebuilding to
+notice, and an edit to `Cargo.toml` could leave it saying clean.
+
+**The meaning chosen is "what was compiled", not "what `git status` says".** A hash claims
+this binary came from that commit, and only these files can make that claim false. A
+modified README casts no doubt on the artifact, so reporting it would be noise in a field
+whose whole job is signal.
+
+The git head is watched as well. With no `cargo:rerun-if-changed` at all, the script
+reruns on a package change and would miss a commit made with no file edits, embedding a
+stale commit — a poor joke given what this is for. With only the git paths, a source edit
+would not rerun it and the build time would predate the binary beside it.
+
+One measured nuance, recorded so nobody re-opens it as a bug. Cargo fingerprints the
+**parsed** manifest rather than its bytes, so a `Cargo.toml` edit that changes nothing
+resolved reruns nothing. Measured: a version bump reran the script and refreshed the
+marker, while a whitespace-only edit and an empty added section rebuilt nothing at all.
+That is correct here. `git status` would call those edits dirty and the marker will not,
+because neither changed what was compiled.
+
+`.git/index` is deliberately not watched. Staging a file moves it from unstaged to staged
+in `git status --porcelain` and leaves the output non-empty either way, so the marker
+cannot flip on a bare `git add`. Verified rather than assumed.
 
 ## The Herdr version floor
 

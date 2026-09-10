@@ -150,24 +150,83 @@ fn matching_versions_are_not_called_stale() {
 }
 
 #[test]
-fn an_unreadable_manifest_degrades_rather_than_failing() {
-    // This is the command that has to work when everything else is broken. One that
-    // errored because it could not find its own manifest would be worse than one that
-    // says less.
+fn each_manifest_failure_says_which_one_it_is() {
+    // These used to collapse into one message, "manifest unknown", which tells somebody
+    // troubleshooting nothing about which of four situations they are in. Troubleshooting
+    // is the use this line was endorsed for.
+    //
+    // The strings match the sibling plugin so the two agree, since the same format was
+    // asked for in both.
     let dir = TempDir::new();
-    let (shown, code) = version(&[("HERDR_PLUGIN_ROOT", dir.path().to_str().unwrap())]);
+    let manifest = dir.join("herdr-plugin.toml");
+    let root = dir.path().to_str().unwrap().to_string();
+
+    let (shown, code) = version(&[("HERDR_PLUGIN_ROOT", &root)]);
     assert_eq!(code, 0, "{}", shown);
-    assert!(shown.contains("manifest unknown"), "{}", shown);
-    assert!(shown.contains(env!("CARGO_PKG_VERSION")), "{}", shown);
+    assert!(shown.contains("manifest unreadable at"), "{}", shown);
+
+    std::fs::write(&manifest, "this is not toml [[[\n").unwrap();
+    let (shown, code) = version(&[("HERDR_PLUGIN_ROOT", &root)]);
+    assert_eq!(code, 0, "{}", shown);
+    assert!(shown.contains("manifest unparsed at"), "{}", shown);
+
+    // The fifth case, which the sibling's three strings do not cover: a manifest that
+    // reads and parses perfectly and simply has no version in it.
+    std::fs::write(&manifest, "id = \"x\"\n").unwrap();
+    let (shown, code) = version(&[("HERDR_PLUGIN_ROOT", &root)]);
+    assert_eq!(code, 0, "{}", shown);
+    assert!(
+        shown.contains("manifest has no version key at"),
+        "{}",
+        shown
+    );
 }
 
 #[test]
-fn an_unparseable_manifest_degrades_rather_than_failing() {
+fn every_manifest_failure_still_names_the_file_it_looked_at() {
+    // A diagnosis without a path leaves the reader guessing which root was resolved, and
+    // the root is derived rather than fixed.
     let dir = TempDir::new();
-    std::fs::write(dir.join("herdr-plugin.toml"), "this is not toml [[[\n").unwrap();
-    let (shown, code) = version(&[("HERDR_PLUGIN_ROOT", dir.path().to_str().unwrap())]);
-    assert_eq!(code, 0, "{}", shown);
-    assert!(shown.contains("manifest unknown"), "{}", shown);
+    let root = dir.path().to_str().unwrap().to_string();
+    for body in [None, Some("not toml [[["), Some("id = \"x\"")] {
+        match body {
+            Some(text) => std::fs::write(dir.join("herdr-plugin.toml"), text).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(dir.join("herdr-plugin.toml"));
+            }
+        }
+        let (shown, _) = version(&[("HERDR_PLUGIN_ROOT", &root)]);
+        assert!(
+            shown.contains(&dir.join("herdr-plugin.toml").display().to_string()),
+            "{:?} -> {}",
+            body,
+            shown
+        );
+    }
+}
+
+#[test]
+fn no_manifest_failure_is_ever_fatal() {
+    // The whole appeal of this command is that it cannot fail. Reading a file at run time
+    // was the objection to adding the manifest line, and this is the answer to it.
+    let dir = TempDir::new();
+    let root = dir.path().to_str().unwrap().to_string();
+    for body in [
+        None,
+        Some("not toml [[["),
+        Some("id = \"x\""),
+        Some("version = 3"),
+    ] {
+        match body {
+            Some(text) => std::fs::write(dir.join("herdr-plugin.toml"), text).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(dir.join("herdr-plugin.toml"));
+            }
+        }
+        let (shown, code) = version(&[("HERDR_PLUGIN_ROOT", &root)]);
+        assert_eq!(code, 0, "{:?} -> {}", body, shown);
+        assert!(shown.contains(env!("CARGO_PKG_VERSION")), "{}", shown);
+    }
 }
 
 #[test]
@@ -206,15 +265,33 @@ fn the_flag_is_refused_twice_like_any_other() {
 }
 
 #[test]
-fn the_build_script_watches_both_the_sources_and_the_commit() {
-    // Neither cargo default is right. With no rerun-if-changed at all, this reruns on a
-    // package change and misses a commit made with no file edits, embedding a stale
-    // commit. With only the git paths, a source edit would not rerun it and the build
-    // time would predate the binary beside it.
+fn the_watch_list_and_the_dirty_pathspec_are_the_same_set() {
+    // The property that makes the marker coherent. One list defines what "dirty" means,
+    // and both halves read it: the paths cargo watches, and the pathspec git status is
+    // asked about.
+    //
+    // They used to differ. The script watched `src` and asked about the whole tree, so a
+    // modified README could mark it dirty with nothing rebuilding to notice, and an edit
+    // to Cargo.toml could leave it saying clean. That matched neither meaning.
     let build = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/build.rs")).unwrap();
     assert!(
-        build.contains("cargo:rerun-if-changed=src"),
-        "the sources must be watched, or the build time goes stale"
+        build.contains("const BUILD_INPUTS"),
+        "one list must define the meaning"
+    );
+    for input in ["src", "build.rs", "Cargo.toml", "Cargo.lock"] {
+        assert!(
+            build.contains(&format!("\"{}\"", input)),
+            "{} is a build input and must be in the list",
+            input
+        );
+    }
+    assert!(
+        build.contains("for input in BUILD_INPUTS"),
+        "the watch list must come from that one list"
+    );
+    assert!(
+        build.contains("args.extend(BUILD_INPUTS)"),
+        "the git pathspec must come from the same one list"
     );
     assert!(
         build.contains("HEAD"),

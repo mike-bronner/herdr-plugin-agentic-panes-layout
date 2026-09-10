@@ -312,10 +312,23 @@ STALE: this binary is 0.3.0 but the manifest is 0.3.1. Rebuild it with `cargo bu
 ```
 
 A commit reading `unknown` means the build had no git or no repository, which is normal
-for a source tarball. A commit marked `-dirty` was built from uncommitted changes, so the
-hash alone would misrepresent what was compiled. Nothing here can fail: every lookup
-degrades to a word, because this is the command you reach for when everything else is
-broken.
+for a source tarball. A commit marked `-dirty` was built from uncommitted changes to
+`src`, `build.rs`, `Cargo.toml` or `Cargo.lock`, so the hash alone would misrepresent what
+was compiled. Edits elsewhere do not mark it, because a modified README casts no doubt on
+the binary. `-unverified` means `git status` itself failed, which is not the same as
+clean.
+
+Nothing here can fail, and each failure says which one it is:
+
+```
+manifest unreadable at /path/herdr-plugin.toml
+manifest unparsed at /path/herdr-plugin.toml
+manifest has no version key at /path/herdr-plugin.toml
+manifest not found: set HERDR_PLUGIN_ROOT to the plugin checkout to read it
+```
+
+This is the command you reach for when everything else is broken, so every lookup
+degrades to a sentence rather than an error.
 
 ### Check a config before you rely on it
 

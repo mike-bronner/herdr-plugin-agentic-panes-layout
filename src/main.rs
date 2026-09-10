@@ -131,7 +131,7 @@ fn version_line() -> String {
     )];
 
     match manifest_version() {
-        Some((version, path)) => {
+        Ok((version, path)) => {
             lines.push(format!("manifest {} at {}", version, path.display()));
             // Said outright rather than left as two numbers to compare. "0.3.0 / 0.3.1"
             // with no explanation invites a bug report instead of a diagnosis.
@@ -143,7 +143,7 @@ fn version_line() -> String {
                 ));
             }
         }
-        None => lines.push("manifest unknown, so staleness cannot be checked".to_string()),
+        Err(why) => lines.push(why),
     }
 
     lines.join("\n")
@@ -154,26 +154,41 @@ fn version_line() -> String {
 /// Resolved from the executable's own location rather than only from
 /// `HERDR_PLUGIN_ROOT`, because `--version` is typed by hand far more often than it is
 /// invoked by Herdr, and by hand that variable is not set.
-fn manifest_version() -> Option<(String, std::path::PathBuf)> {
+///
+/// **Each failure says which one it is.** This used to return an `Option`, so four
+/// different situations printed one message: "manifest unknown". That tells somebody
+/// troubleshooting nothing about which of them they are in, and troubleshooting is the
+/// use Mike endorsed this line for. The `not found` case also names the fix, which is
+/// the property that makes the `STALE` line worth having.
+///
+/// Still cannot fail. Every path returns a sentence rather than an error.
+fn manifest_version() -> Result<(String, std::path::PathBuf), String> {
     let root = match std::env::var_os("HERDR_PLUGIN_ROOT") {
         Some(root) if !root.is_empty() => std::path::PathBuf::from(root),
         // <root>/target/<profile>/agent-layout
         _ => std::env::current_exe()
-            .ok()?
-            .parent()?
-            .parent()?
-            .parent()?
-            .to_path_buf(),
+            .ok()
+            .and_then(|exe| Some(exe.parent()?.parent()?.parent()?.to_path_buf()))
+            .ok_or_else(|| {
+                "manifest not found: set HERDR_PLUGIN_ROOT to the plugin checkout to read it"
+                    .to_string()
+            })?,
     };
+
     let path = root.join("herdr-plugin.toml");
-    let version = std::fs::read_to_string(&path)
-        .ok()?
+    let text = std::fs::read_to_string(&path)
+        .map_err(|_| format!("manifest unreadable at {}", path.display()))?;
+    let parsed = text
         .parse::<toml::Table>()
-        .ok()?
-        .get("version")?
-        .as_str()?
-        .to_string();
-    Some((version, path))
+        .map_err(|_| format!("manifest unparsed at {}", path.display()))?;
+    let version = parsed
+        .get("version")
+        .and_then(|v| v.as_str())
+        // The fifth case, which the sibling plugin's three strings do not cover: a
+        // manifest that reads perfectly well and simply has no version in it.
+        .ok_or_else(|| format!("manifest has no version key at {}", path.display()))?;
+
+    Ok((version.to_string(), path))
 }
 
 fn event_workspace_is_focused() -> bool {
