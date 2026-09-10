@@ -218,6 +218,20 @@ If you are switching from this form to the action, edit that one entry in
 `~/.config/herdr/config.toml`; nothing else changes, and both forms do the same
 thing.
 
+## Finding the plugin
+
+Both commands below are run from the plugin's checkout, and **Herdr will tell you where
+that is**:
+
+```sh
+herdr plugin list
+# - mikebronner.agentic-panes-layout (Agentic Panes Layout) enabled [local:/path/to/checkout]
+```
+
+The path in brackets is the plugin root. Every `bin/agent-layout ...` in this document
+means that path plus `/bin/agent-layout`. If you linked the plugin yourself you already
+know it; if you installed from GitHub, this is how to find it.
+
 ## Configure
 
 Settings live in **one TOML file in Herdr's config root**, beside Herdr's own
@@ -227,7 +241,18 @@ Settings live in **one TOML file in Herdr's config root**, beside Herdr's own
 ~/.config/herdr/agent-layout.toml
 ```
 
-The file is optional. Here is the built-in layout written out, ready to edit:
+That is a different place from the plugin checkout above. The config lives with Herdr's
+own settings, and the plugin lives wherever you installed it.
+
+**The file is optional.** With no file at all you get the three-pane layout shown at the
+top of this page. Write one when you want something else.
+
+### The shape
+
+A file holds **layouts**. A layout holds **tabs**. A tab holds **panes**. One
+top-level `default` says which layout to use.
+
+Here is the built-in layout written out, ready to edit:
 
 ```toml
 default = "three-pane"
@@ -248,9 +273,47 @@ split = "down"
 ratio = 0.6
 ```
 
-Add a `label` to any pane to have it renamed. Omit the key and no rename happens.
+Every key on a pane is optional:
 
-Point a project at a different layout with a `[[projects]]` rule:
+| Key | What it does |
+|---|---|
+| `agent` | Starts an agent of that kind in the pane. |
+| `command` | One command line, typed into the pane's own shell. Flags work unquoted. |
+| `split` | `right` or `down`. Required on every pane after the first. |
+| `ratio` | The share kept by the pane **being split**. Omit it and Herdr chooses. |
+| `label` | Renames the pane. **Omit it and no rename happens at all.** |
+
+### One pane block is one pane, not one split
+
+The commonest mistake, and the natural misreading. To get **two panes** side by side,
+write **two** pane blocks:
+
+```toml
+[[layouts.two.tabs]]
+name = "work"
+
+# The tab's own pane. It already exists, so this block can be empty.
+[[layouts.two.tabs.panes]]
+
+# The second pane, split out of the first.
+[[layouts.two.tabs.panes]]
+split = "right"
+ratio = 0.5
+```
+
+A single block carrying `split = "right"` is **rejected**, because the first block
+describes the tab's own pane and nothing splits that into existence.
+
+### `ratio` sizes the pane being split, not the new one
+
+In the built-in layout above, `ratio = 0.6` sits on the third pane and applies to the
+**second**. Each pane after the first splits the one before it, and the ratio is the
+share the older pane keeps. `--check` prints this back to you as `pane 2 keeps 0.6`, so
+you can see which pane a number actually sizes.
+
+### Using a different layout for a project
+
+Scoping is done with a `[[projects]]` rule, **not** with a key on a tab or a layout:
 
 ```toml
 default = "three-pane"
@@ -266,9 +329,28 @@ name = "agent"
 agent = "claude"
 ```
 
-`path` is matched against both the workspace's checkout path and its repo root, so
-naming a repository covers every worktree of it. Rules are evaluated in file
-order and the first match wins.
+A rule's `path` is matched against the workspace's own directory, its checkout path,
+and its repo root. So naming a repository covers every worktree of it, and naming a
+plain directory such as your home directory works too. Rules are evaluated in **file
+order and the first match wins**, so put narrower rules first. There is no prefix
+matching and there are no globs.
+
+### Check it before you rely on it
+
+```sh
+bin/agent-layout --check
+```
+
+Do this after every edit. It reports every problem, says which layouts are usable, and
+prints the tabs and panes it would build. It touches nothing.
+
+A bad file never breaks your workspace. A layout with a mistake is skipped on its own
+and the others keep working, and a file that will not parse falls back to the built-in
+layout. Either way the problems appear in a popup.
+
+**[`docs/configuration.md`](docs/configuration.md) is the full reference**: every key,
+how the config root is derived, what each kind of bad file does, and the measurements
+behind those choices.
 
 ### A broken config is not silent
 
